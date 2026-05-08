@@ -15,7 +15,7 @@ class HackerNewsParser:
         self.base_url = "https://hacker-news.firebaseio.com/v0"
     
     def search_stories(self, max_results: int = 50) -> List[Dict[str, Any]]:
-        """Поиск историй по ключевым словам за последние 24 часа"""
+        """Поиск топ-историй по ключевым словам за последние 7 дней"""
         stories = []
         
         try:
@@ -24,13 +24,13 @@ class HackerNewsParser:
             top_stories_response.raise_for_status()
             top_story_ids = top_stories_response.json()
             
-            # Получаем ID новых историй
-            new_stories_response = requests.get(f"{self.base_url}/newstories.json")
-            new_stories_response.raise_for_status()
-            new_story_ids = new_stories_response.json()
+            # Получаем ID лучших историй
+            best_stories_response = requests.get(f"{self.base_url}/beststories.json")
+            best_stories_response.raise_for_status()
+            best_story_ids = best_stories_response.json()
             
             # Объединяем и ограничиваем количество
-            all_story_ids = (top_story_ids + new_story_ids)[:max_results * 2]
+            all_story_ids = (best_story_ids + top_story_ids)[:max_results * 3]
             
             self.logger.info(f"Проверяем {len(all_story_ids)} историй")
             
@@ -49,6 +49,7 @@ class HackerNewsParser:
                     continue
             
             self.logger.info(f"Найдено {len(stories)} подходящих историй")
+            stories.sort(key=lambda x: (x.get("score", 0), x.get("comments_count", 0)), reverse=True)
             return stories
             
         except Exception as e:
@@ -73,8 +74,8 @@ class HackerNewsParser:
             else:
                 published_date = None
             
-            # Проверяем, что история свежая (за последние 24 часа)
-            if not self.filter.is_recent_news(published_date, 24):
+            # Проверяем, что история за последние N дней
+            if not self.filter.is_recent_news(published_date, self.config.NEWS_LOOKBACK_DAYS * 24):
                 return None
             
             story_data = {
@@ -117,7 +118,7 @@ class HackerNewsParser:
         return True
     
     def get_best_stories(self, max_results: int = 30) -> List[Dict[str, Any]]:
-        """Получает лучшие истории за последние 24 часа"""
+        """Получает лучшие истории за последние 7 дней"""
         stories = []
         
         try:
@@ -150,7 +151,7 @@ class HackerNewsParser:
             return []
     
     def get_ask_hn_stories(self, max_results: int = 20) -> List[Dict[str, Any]]:
-        """Получает истории из Ask HN за последние 24 часа"""
+        """Получает истории из Ask HN за последние 7 дней"""
         stories = []
         
         try:
@@ -183,7 +184,7 @@ class HackerNewsParser:
             return []
     
     def get_show_hn_stories(self, max_results: int = 20) -> List[Dict[str, Any]]:
-        """Получает истории из Show HN за последние 24 часа"""
+        """Получает истории из Show HN за последние 7 дней"""
         stories = []
         
         try:

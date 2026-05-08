@@ -23,11 +23,11 @@ def test_config():
     try:
         config = Config()
         print(f"OK Конфигурация загружена")
-        print(f"   - YouTube: {'включен' if config.ENABLE_YOUTUBE else 'отключен'}")
         print(f"   - Twitter: {'включен' if config.ENABLE_TWITTER else 'отключен'}")
         print(f"   - Google News: {'включен' if config.ENABLE_GOOGLE_NEWS else 'отключен'}")
         print(f"   - Hacker News: {'включен' if config.ENABLE_HACKERNEWS else 'отключен'}")
         print(f"   - Reddit: {'включен' if config.ENABLE_REDDIT else 'отключен'}")
+        print(f"   - YouTube: {'включен' if config.ENABLE_YOUTUBE else 'отключен'}")
         
         # Проверяем обязательные настройки
         if not config.TELEGRAM_BOT_TOKEN:
@@ -100,18 +100,6 @@ def test_parsers():
     config = Config()
     results = {}
     
-    # YouTube
-    if config.ENABLE_YOUTUBE:
-        try:
-            from sources.youtube_parser import YouTubeParser
-            parser = YouTubeParser()
-            news = parser.search_videos(max_results=1)
-            results['YouTube'] = f"OK {len(news)} новостей"
-        except Exception as e:
-            results['YouTube'] = f"ERROR {str(e)[:50]}..."
-    else:
-        results['YouTube'] = "⏭️ отключен"
-    
     # Twitter
     if config.ENABLE_TWITTER:
         try:
@@ -159,6 +147,18 @@ def test_parsers():
             results['Reddit'] = f"ERROR {str(e)[:50]}..."
     else:
         results['Reddit'] = "⏭️ отключен"
+
+    # YouTube
+    if config.ENABLE_YOUTUBE:
+        try:
+            from sources.youtube_parser import YouTubeParser
+            parser = YouTubeParser()
+            news = parser.search_videos(max_results=1)
+            results['YouTube'] = f"OK {len(news)} видео"
+        except Exception as e:
+            results['YouTube'] = f"ERROR {str(e)[:50]}..."
+    else:
+        results['YouTube'] = "⏭️ отключен"
     
     # Выводим результаты
     for source, result in results.items():

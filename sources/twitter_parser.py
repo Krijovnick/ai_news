@@ -14,20 +14,20 @@ class TwitterParser:
         self.logger = logging.getLogger(__name__)
     
     def search_tweets(self, max_results: int = 100) -> List[Dict[str, Any]]:
-        """Поиск твитов по хэштегам за последние 24 часа"""
+        """Поиск топ-твитов по хэштегам за последние 7 дней"""
         tweets = []
         
         try:
-            # Вычисляем дату 24 часа назад в UTC
+            # Вычисляем дату 7 дней назад в UTC
             from datetime import timezone
-            since_date = datetime.now(timezone.utc) - timedelta(hours=24)
+            since_date = datetime.now(timezone.utc) - timedelta(days=self.config.NEWS_LOOKBACK_DAYS)
             since_str = since_date.strftime('%Y-%m-%d')
             
             # Поиск по каждому хэштегу
             for hashtag in self.config.TWITTER_HASHTAGS:
                 try:
                     # Формируем поисковый запрос
-                    query = f"{hashtag} since:{since_str} -filter:retweets"
+                    query = f"{hashtag} since:{since_str} -filter:retweets min_faves:20"
                     
                     self.logger.info(f"Поиск твитов с запросом: {query}")
                     
@@ -52,6 +52,14 @@ class TwitterParser:
             
             # Удаляем дубликаты
             tweets = self.filter.remove_duplicates(tweets)
+            tweets.sort(
+                key=lambda x: (
+                    x.get("like_count", 0) * 2
+                    + x.get("retweet_count", 0) * 3
+                    + x.get("reply_count", 0)
+                ),
+                reverse=True,
+            )
             
             self.logger.info(f"Всего найдено уникальных твитов: {len(tweets)}")
             return tweets
@@ -65,16 +73,16 @@ class TwitterParser:
         tweets = []
         
         try:
-            # Вычисляем дату 24 часа назад в UTC
+            # Вычисляем дату 7 дней назад в UTC
             from datetime import timezone
-            since_date = datetime.now(timezone.utc) - timedelta(hours=24)
+            since_date = datetime.now(timezone.utc) - timedelta(days=self.config.NEWS_LOOKBACK_DAYS)
             since_str = since_date.strftime('%Y-%m-%d')
             
             # Поиск по ключевым словам
-            for keyword in self.config.AI_KEYWORDS[:5]:  # Ограничиваем количество запросов
+            for keyword in self.config.AI_KEYWORDS[:10]:  # Ограничиваем количество запросов
                 try:
                     # Формируем поисковый запрос
-                    query = f'"{keyword}" since:{since_str} -filter:retweets lang:en'
+                    query = f'"{keyword}" since:{since_str} -filter:retweets lang:en min_faves:20'
                     
                     self.logger.info(f"Поиск твитов с запросом: {query}")
                     
@@ -109,8 +117,8 @@ class TwitterParser:
     def _extract_tweet_data(self, tweet) -> Dict[str, Any]:
         """Извлекает данные о твите"""
         try:
-            # Проверяем, что твит свежий (за последние 24 часа)
-            if not self.filter.is_recent_news(tweet.date, 24):
+            # Проверяем, что твит за последние N дней
+            if not self.filter.is_recent_news(tweet.date, self.config.NEWS_LOOKBACK_DAYS * 24):
                 return None
             
             tweet_data = {
@@ -158,7 +166,7 @@ class TwitterParser:
         
         try:
             # Поиск популярных твитов
-            since_date = datetime.now() - timedelta(hours=24)
+            since_date = datetime.now() - timedelta(days=self.config.NEWS_LOOKBACK_DAYS)
             since_str = since_date.strftime('%Y-%m-%d')
             
             # Комбинированный запрос для популярных твитов

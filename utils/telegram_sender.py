@@ -86,9 +86,15 @@ class TelegramSender:
         error_text = f"❌ *Ошибка в AI News Aggregator*\n\n{error_message}"
         return self.send_message(error_text)
     
-    def send_summary(self, news_count: int, sources_used: list, errors: list = None) -> bool:
+    def send_summary(
+        self,
+        news_count: int,
+        sources_used: list,
+        errors: list = None,
+        run_name: str = "AI News Aggregator",
+    ) -> bool:
         """Отправляет сводку о работе агрегатора"""
-        summary = f"📊 *Сводка работы AI News Aggregator*\n\n"
+        summary = f"📊 *Сводка работы {run_name}*\n\n"
         summary += f"📰 Найдено новостей: {news_count}\n"
         summary += f"🔍 Источники: {', '.join(sources_used)}\n"
         

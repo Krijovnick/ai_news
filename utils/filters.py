@@ -14,12 +14,10 @@ class NewsFilter:
         if not published_date:
             return False
         
-        # Получаем текущее время с учетом часового пояса
         from datetime import timezone
         now = datetime.now(timezone.utc)
         cutoff_time = now - timedelta(hours=hours)
         
-        # Если published_date не имеет часового пояса, добавляем UTC
         if published_date.tzinfo is None:
             published_date = published_date.replace(tzinfo=timezone.utc)
         
@@ -32,10 +30,8 @@ class NewsFilter:
         
         text_lower = text.lower()
         
-        # Проверяем наличие ключевых слов
         has_ai_keywords = any(keyword.lower() in text_lower for keyword in self.config.AI_KEYWORDS)
         
-        # Проверяем отсутствие исключаемых слов
         has_exclude_keywords = any(keyword.lower() in text_lower for keyword in self.config.EXCLUDE_KEYWORDS)
         
         return has_ai_keywords and not has_exclude_keywords
@@ -49,7 +45,6 @@ class NewsFilter:
         if not text:
             return ""
         
-        # Удаляем лишние пробелы и переносы строк
         text = re.sub(r'\s+', ' ', text)
         text = text.strip()
         
@@ -74,29 +69,23 @@ class NewsFilter:
         if not text:
             return False
         
-        # Подсчитываем количество символов разных алфавитов
         cyrillic_count = len(re.findall(r'[а-яё]', text.lower()))
         latin_count = len(re.findall(r'[a-z]', text.lower()))
         
-        # Подсчитываем нежелательные символы (японские, китайские, арабские и т.д.)
         unwanted_chars = len(re.findall(r'[^\w\s\-.,!?()\[\]":;@#$%^&*+=<>/\\|`~]', text))
         
-        # Подсчитываем общее количество значимых символов
         total_letters = cyrillic_count + latin_count
         total_chars = len(re.findall(r'[^\s]', text))  # Все не-пробельные символы
         
         if total_letters == 0:
             return False
         
-        # Если есть нежелательные символы - исключаем
         if unwanted_chars > 0:
             return False
         
-        # Если больше 80% символов кириллицы или латиницы - считаем подходящим
         cyrillic_ratio = cyrillic_count / total_letters
         latin_ratio = latin_count / total_letters
         
-        # Дополнительная проверка: должно быть минимум 3 буквы и 80% из них - кириллица или латиница
         return total_letters >= 3 and (cyrillic_ratio > 0.8 or latin_ratio > 0.8)
     
     def calculate_relevance_score(self, title: str, description: str = "", keywords: List[str] = None) -> int:
@@ -107,25 +96,21 @@ class NewsFilter:
         score = 0
         text = f"{title} {description}".lower()
         
-        # Базовые ключевые слова (высокий приоритет)
         high_priority = ["chatgpt", "openai", "claude", "gemini", "sora", "gpt-4", "gpt-5"]
         for keyword in high_priority:
             if keyword in text:
                 score += 20
         
-        # Средние ключевые слова
         medium_priority = ["ai", "artificial intelligence", "stable diffusion", "midjourney"]
         for keyword in medium_priority:
             if keyword in text:
                 score += 10
         
-        # Низкие ключевые слова
         low_priority = ["machine learning", "deep learning", "neural network"]
         for keyword in low_priority:
             if keyword in text:
                 score += 5
         
-        # Бонус за количество найденных ключевых слов
         if keywords:
             score += min(len(keywords) * 5, 20)
         
@@ -140,7 +125,6 @@ class NewsFilter:
             description = news.get('description', '')
             keywords = news.get('keywords', [])
             
-            # Проверяем язык заголовка
             if not self.is_english_or_russian(title):
                 continue
             
@@ -148,13 +132,44 @@ class NewsFilter:
             
             if score >= min_score:
                 news['relevance_score'] = score
+                news['popularity_score'] = self.calculate_popularity_score(news)
+                news['ranking_score'] = score * 0.6 + news['popularity_score'] * 0.4
                 filtered_news.append(news)
         
-        # Сортируем по релевантности
-        filtered_news.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+        filtered_news.sort(key=lambda x: x.get('ranking_score', 0), reverse=True)
         
         return filtered_news
-    
+
+    def calculate_popularity_score(self, news: Dict[str, Any]) -> int:
+        """Единая оценка популярности контента (0-100) для разных источников."""
+        if not news:
+            return 0
+
+        popularity = 0.0
+        popularity += float(news.get("view_count", 0)) / 2000.0
+        popularity += float(news.get("like_count", 0)) / 150.0
+        popularity += float(news.get("retweet_count", 0)) / 80.0
+        popularity += float(news.get("reply_count", 0)) / 80.0
+        popularity += float(news.get("score", 0)) / 8.0
+        popularity += float(news.get("comments_count", 0)) / 20.0
+
+        return int(min(popularity, 100))
+
+    def filter_business_reddit_posts(
+        self,
+        posts: List[Dict[str, Any]],
+        max_items: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Язык + сортировка по Reddit score (популярность), без ИИ-релевантности."""
+        out: List[Dict[str, Any]] = []
+        for post in posts:
+            title = post.get("title", "")
+            if not self.is_english_or_russian(title):
+                continue
+            out.append(post)
+        out.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return out[:max_items]
+
     def remove_duplicates(self, news_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Удаляет дубликаты новостей"""
         seen_titles = set()
@@ -176,7 +191,7 @@ class NewsFilter:
     def format_news_for_telegram(self, news_list: List[Dict[str, Any]], max_items: int = 20) -> str:
         """Форматирует новости для отправки в Telegram"""
         if not news_list:
-            return "📰 *AI News Digest*\n\nНовостей не найдено за последние 24 часа."
+            return f"📰 *AI News Digest*\n\nНовостей не найдено за последние {self.config.NEWS_LOOKBACK_DAYS} дней."
         
         # Ограничиваем количество новостей
         news_list = news_list[:max_items]
@@ -209,22 +224,12 @@ class NewsFilter:
                     'link': '🔗'
                 }
                 content_emoji = emoji_map.get(content_type, '📄')
-            
-            # Добавляем длительность для YouTube видео
-            duration_info = ""
-            if 'YouTube' in source and duration > 0:
-                minutes = duration // 60
-                seconds = duration % 60
-                if minutes > 0:
-                    duration_info = f" ({minutes}м {seconds}с)"
-                else:
-                    duration_info = f" ({seconds}с)"
-            
-            # Формируем строку с учетом типа контента и длительности
+                        
+            # Формируем строку с учетом типа контента
             if content_emoji:
-                news_item = f"🔹 {content_emoji} <a href='{url}'>{title}</a>{duration_info}\nИсточник: {source}"
+                news_item = f"🔹 {content_emoji} <a href='{url}'>{title}</a>\nИсточник: {source}"
             else:
-                news_item = f"🔹 <a href='{url}'>{title}</a>{duration_info}\nИсточник: {source}"
+                news_item = f"🔹 <a href='{url}'>{title}</a>\nИсточник: {source}"
             
             news_items.append(news_item)
         

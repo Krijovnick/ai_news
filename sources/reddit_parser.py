@@ -24,7 +24,7 @@ class RedditParser:
         )
     
     def search_posts(self, max_results: int = 50) -> List[Dict[str, Any]]:
-        """Поиск постов по сабреддитам за последние 24 часа"""
+        """Поиск топ-постов по сабреддитам за последние 7 дней"""
         posts = []
         
         try:
@@ -42,6 +42,7 @@ class RedditParser:
             
             # Удаляем дубликаты
             posts = self.filter.remove_duplicates(posts)
+            posts.sort(key=lambda x: (x.get("score", 0), x.get("comments_count", 0)), reverse=True)
             
             self.logger.info(f"Всего найдено уникальных постов: {len(posts)}")
             return posts
@@ -57,18 +58,10 @@ class RedditParser:
         try:
             subreddit = self.reddit.subreddit(subreddit_name)
             
-            # Получаем горячие посты
-            hot_posts = subreddit.hot(limit=max_results)
-            
-            for post in hot_posts:
-                post_data = self._extract_post_data(post)
-                if post_data and self._is_valid_post(post_data):
-                    posts.append(post_data)
-            
-            # Получаем новые посты
-            new_posts = subreddit.new(limit=max_results)
-            
-            for post in new_posts:
+            # Получаем топ-посты за неделю
+            top_posts = subreddit.top(time_filter='week', limit=max_results)
+
+            for post in top_posts:
                 post_data = self._extract_post_data(post)
                 if post_data and self._is_valid_post(post_data):
                     posts.append(post_data)
@@ -86,8 +79,8 @@ class RedditParser:
             from datetime import timezone
             published_date = datetime.fromtimestamp(post.created_utc, tz=timezone.utc)
             
-            # Проверяем, что пост свежий (за последние 24 часа)
-            if not self.filter.is_recent_news(published_date, 24):
+            # Проверяем, что пост за последние N дней
+            if not self.filter.is_recent_news(published_date, self.config.NEWS_LOOKBACK_DAYS * 24):
                 return None
             
             # Всегда используем ссылку на сам пост в Reddit
@@ -96,9 +89,11 @@ class RedditParser:
             # Определяем тип контента для лучшего понимания
             content_type = self._get_content_type(post)
             
+            selftext = getattr(post, "selftext", None) or ""
             post_data = {
                 'title': post.title,
                 'url': reddit_url,
+                'description': (selftext.strip() or "")[:4000],
                 'author': str(post.author) if post.author else 'deleted',
                 'published_date': published_date,
                 'score': post.score,
@@ -106,7 +101,7 @@ class RedditParser:
                 'comments_count': post.num_comments,
                 'subreddit': post.subreddit,
                 'content_type': content_type,
-                'keywords': self.filter.extract_keywords_from_text(post.title + ' ' + (post.selftext if hasattr(post, 'selftext') else ''))
+                'keywords': self.filter.extract_keywords_from_text(post.title + ' ' + selftext)
             }
             
             return post_data
@@ -130,7 +125,7 @@ class RedditParser:
                 return 'image'
             
             # Видео
-            if any(ext in url for ext in ['.mp4', '.webm', '.mov', 'youtube.com', 'youtu.be', 'vimeo.com', 'streamable.com']):
+            if any(ext in url for ext in ['.mp4', '.webm', '.mov', 'vimeo.com', 'streamable.com']):
                 return 'video'
             
             # Внешние ссылки
@@ -145,23 +140,22 @@ class RedditParser:
             return 'unknown'
     
     def _is_valid_post(self, post_data: Dict[str, Any]) -> bool:
-        """Проверяет, подходит ли пост для включения в дайджест"""
+        """Проверяет, подходит ли пост для включения в AI-дайджест Reddit."""
         if not post_data:
             return False
         
-        title = post_data.get('title', '')
-        
-        # Проверяем наличие ключевых слов
-        if not self.filter.contains_ai_keywords(title):
+        title = (post_data.get("title") or "").strip()
+        if len(title) < 15:
+            return False
+        lower = title.lower()
+        if lower in ("[deleted]", "[removed]"):
             return False
         
-        # Проверяем минимальную длину заголовка
-        if len(title) < 10:
-            return False
-        
-        # Проверяем минимальный рейтинг
-        score = post_data.get('score', 0)
-        if score < 1:
+        # В AI-режиме Reddit берём топы по сабреддитам за неделю,
+        # поэтому фильтр по ключевым словам не применяем.
+        # Отсекаем только слабые посты по score.
+        score = post_data.get("score", 0)
+        if score < 5:
             return False
         
         return True
@@ -177,7 +171,7 @@ class RedditParser:
                     subreddit = self.reddit.subreddit(subreddit_name)
                     
                     # Получаем топ посты
-                    top_posts = subreddit.top(time_filter='day', limit=max_results // len(self.config.REDDIT_SUBREDDITS))
+                    top_posts = subreddit.top(time_filter='week', limit=max_results // len(self.config.REDDIT_SUBREDDITS))
                     
                     for post in top_posts:
                         post_data = self._extract_post_data(post)
@@ -201,7 +195,7 @@ class RedditParser:
         
         try:
             # Поиск по каждому ключевому слову
-            for keyword in self.config.AI_KEYWORDS[:5]:  # Ограничиваем количество запросов
+            for keyword in self.config.AI_KEYWORDS:  # Ограничиваем количество запросов
                 try:
                     # Поиск по всем сабреддитам
                     for subreddit_name in self.config.REDDIT_SUBREDDITS:
@@ -209,7 +203,7 @@ class RedditParser:
                             subreddit = self.reddit.subreddit(subreddit_name)
                             
                             # Поиск по ключевому слову
-                            search_results = subreddit.search(keyword, sort='new', time_filter='day', limit=5)
+                            search_results = subreddit.search(keyword, sort='top', time_filter='week', limit=5)
                             
                             for post in search_results:
                                 post_data = self._extract_post_data(post)
@@ -232,4 +226,57 @@ class RedditParser:
             
         except Exception as e:
             self.logger.error(f"Ошибка при поиске постов по ключевым словам: {e}")
+            return []
+
+    def _is_valid_business_post(self, post_data: Dict[str, Any]) -> bool:
+        """Пост для бизнес-дайджеста: без фильтра по ИИ-ключевым словам."""
+        if not post_data:
+            return False
+        title = (post_data.get("title") or "").strip()
+        if len(title) < 15:
+            return False
+        lower = title.lower()
+        if lower in ("[deleted]", "[removed]"):
+            return False
+        score = post_data.get("score", 0)
+        if score < self.config.REDDIT_BUSINESS_MIN_SCORE:
+            return False
+        return True
+
+    def search_business_posts(self, max_results: int = 50) -> List[Dict[str, Any]]:
+        """
+        Популярные посты из бизнес-сабреддитов: top(week) + только за последние 7 дней
+        (фильтр даты в _extract_post_data).
+        """
+        posts: List[Dict[str, Any]] = []
+        subs = self.config.REDDIT_BUSINESS_SUBREDDITS
+        limit_per_sub = max(3, self.config.REDDIT_BUSINESS_TOP_PER_SUB)
+
+        try:
+            for subreddit_name in subs:
+                try:
+                    subreddit = self.reddit.subreddit(subreddit_name)
+                    for post in subreddit.top(time_filter="week", limit=limit_per_sub):
+                        if getattr(post, "stickied", False):
+                            continue
+                        post_data = self._extract_post_data(post)
+                        if post_data and self._is_valid_business_post(post_data):
+                            posts.append(post_data)
+                    self.logger.debug(
+                        "Бизнес Reddit: r/%s (top за неделю, limit=%s)",
+                        subreddit_name,
+                        limit_per_sub,
+                    )
+                except Exception as e:
+                    self.logger.error("Ошибка бизнес-сбора в r/%s: %s", subreddit_name, e)
+                    continue
+
+            posts = self.filter.remove_duplicates(posts)
+            posts.sort(key=lambda x: x.get("score", 0), reverse=True)
+            if len(posts) > max_results:
+                posts = posts[:max_results]
+            self.logger.info("Бизнес Reddit: всего уникальных постов после среза: %s", len(posts))
+            return posts
+        except Exception as e:
+            self.logger.error("Ошибка search_business_posts: %s", e)
             return []

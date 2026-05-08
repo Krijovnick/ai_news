@@ -21,7 +21,7 @@ class GoogleNewsParser:
         
         try:
             # Поиск по каждому ключевому слову
-            for keyword in self.config.AI_KEYWORDS[:8]:  # Ограничиваем количество запросов
+            for keyword in self.config.AI_KEYWORDS[:20]:  # Ограничиваем количество запросов
                 try:
                     keyword_news = self._search_by_keyword(keyword, max_results // len(self.config.AI_KEYWORDS[:8]))
                     news_items.extend(keyword_news)
@@ -97,8 +97,8 @@ class GoogleNewsParser:
             elif hasattr(entry, 'updated_parsed') and entry.updated_parsed:
                 published_date = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc)
             
-            # Проверяем, что новость свежая (за последние 24 часа)
-            if not self.filter.is_recent_news(published_date, 24):
+            # Проверяем, что новость свежая (за последние N дней)
+            if not self.filter.is_recent_news(published_date, self.config.NEWS_LOOKBACK_DAYS * 24):
                 return None
             
             # Извлекаем источник из ссылки или заголовка
