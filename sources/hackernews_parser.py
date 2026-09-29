@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any
 import requests
 from utils.config import Config
@@ -48,9 +48,21 @@ class HackerNewsParser:
                     self.logger.error(f"Ошибка при получении истории {story_id}: {e}")
                     continue
             
+            dev_stories = self._search_discovery_stories()
+            stories.extend(dev_stories)
+            stories = self.filter.remove_duplicates(stories)
+
             self.logger.info(f"Найдено {len(stories)} подходящих историй")
             stories.sort(key=lambda x: (x.get("score", 0), x.get("comments_count", 0)), reverse=True)
-            return stories
+            # Истории про новые инструменты не вытесняются общим топом
+            priority = []
+            rest = []
+            for story in stories:
+                if self.filter.matches_discovery(story.get("title", "")):
+                    priority.append(story)
+                else:
+                    rest.append(story)
+            return (priority + rest)[:max_results]
             
         except Exception as e:
             self.logger.error(f"Ошибка при поиске историй: {e}")
@@ -116,6 +128,63 @@ class HackerNewsParser:
             return False
         
         return True
+
+    def _search_discovery_stories(self, hits_per_query: int = 8) -> List[Dict[str, Any]]:
+        """Ищет на HN новые инструменты и способы автоматизации, без имён известных продуктов."""
+        stories = []
+        keywords = getattr(self.config, "DISCOVERY_KEYWORDS", []) or []
+        since = datetime.now(timezone.utc) - timedelta(days=self.config.NEWS_LOOKBACK_DAYS)
+        since_ts = int(since.timestamp())
+
+        for keyword in keywords:
+            try:
+                response = requests.get(
+                    "https://hn.algolia.com/api/v1/search_by_date",
+                    params={
+                        "query": keyword,
+                        "tags": "story",
+                        "numericFilters": f"created_at_i>{since_ts}",
+                        "hitsPerPage": hits_per_query,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+                found = 0
+                for hit in response.json().get("hits", []):
+                    story = self._story_from_algolia(hit)
+                    if story and self._is_valid_story(story):
+                        stories.append(story)
+                        found += 1
+                self.logger.info("HN discovery '%s': %s историй", keyword, found)
+            except Exception as e:
+                self.logger.error("Ошибка поиска HN '%s': %s", keyword, e)
+                continue
+
+        return stories
+
+    def _story_from_algolia(self, hit: Dict[str, Any]) -> Dict[str, Any]:
+        """Приводит хит Algolia к формату истории агрегатора."""
+        title = (hit or {}).get("title") or ""
+        if not title:
+            return None
+
+        created = hit.get("created_at_i")
+        published_date = datetime.fromtimestamp(created, tz=timezone.utc) if created else None
+        if not self.filter.is_recent_news(published_date, self.config.NEWS_LOOKBACK_DAYS * 24):
+            return None
+
+        story_id = hit.get("objectID")
+        url = hit.get("url") or (f"https://news.ycombinator.com/item?id={story_id}" if story_id else "")
+        return {
+            "title": title,
+            "url": url,
+            "author": hit.get("author", ""),
+            "published_date": published_date,
+            "score": hit.get("points", 0) or 0,
+            "source": "Hacker News",
+            "comments_count": hit.get("num_comments", 0) or 0,
+            "keywords": self.filter.extract_keywords_from_text(title),
+        }
     
     def get_best_stories(self, max_results: int = 30) -> List[Dict[str, Any]]:
         """Получает лучшие истории за последние 7 дней"""

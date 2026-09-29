@@ -12,29 +12,6 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
     
-    # Провайдер суммаризации: gemini | deepseek | openrouter
-    SUMMARIZER_PROVIDER = os.getenv('SUMMARIZER_PROVIDER', 'gemini').lower()
-
-    # Gemini / Google AI
-    GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-    GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
-    # Ограничиваем частоту запросов, чтобы не упираться в лимит free tier (5 rpm)
-    GEMINI_REQUESTS_PER_MINUTE = int(os.getenv('GEMINI_REQUESTS_PER_MINUTE', '4'))
-
-    # DeepSeek (OpenAI-совместимое API)
-    DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
-    DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
-    DEEPSEEK_REQUESTS_PER_MINUTE = int(os.getenv('DEEPSEEK_REQUESTS_PER_MINUTE', '8'))
-
-    # OpenRouter (OpenAI-совместимое API, можно проксировать DeepSeek)
-    OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-    OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'deepseek/deepseek-chat')
-    OPENROUTER_BASE_URL = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1')
-    OPENROUTER_REQUESTS_PER_MINUTE = int(os.getenv('OPENROUTER_REQUESTS_PER_MINUTE', '8'))
-
-    # Включать ли вообще ИИ-суммаризацию (если false — шлём новости без выжимок)
-    ENABLE_SUMMARIZER = os.getenv('ENABLE_SUMMARIZER', 'true').lower() == 'true'
-    
     # Reddit API
     REDDIT_CLIENT_ID = os.getenv('REDDIT_CLIENT_ID')
     REDDIT_CLIENT_SECRET = os.getenv('REDDIT_CLIENT_SECRET')
@@ -45,62 +22,154 @@ class Config:
     ENABLE_GOOGLE_NEWS = os.getenv('ENABLE_GOOGLE_NEWS', 'true').lower() == 'true'
     ENABLE_HACKERNEWS = os.getenv('ENABLE_HACKERNEWS', 'true').lower() == 'true'
     ENABLE_REDDIT = os.getenv('ENABLE_REDDIT', 'true').lower() == 'true'
-    ENABLE_YOUTUBE = os.getenv('ENABLE_YOUTUBE', 'true').lower() == 'true'
     
     # Логирование
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
     
-    # Ключевые слова для поиска
+    # Запросы без названий конкретных продуктов: так всплывают новые инструменты,
+    # фреймворки и способы автоматизации, а не уже известные темы.
+    DISCOVERY_KEYWORDS = [
+        "new AI agent tool",
+        "new AI developer tool",
+        "new AI automation tool",
+        "emerging AI agents",
+        "open source AI agents",
+        "new AI workflow tool",
+        "AI tools for developers",
+        "новые ИИ инструменты для бизнеса",
+        "новый инструмент для ИИ агентов",
+    ]
+
+    # Ключевые слова для поиска (практика: автоматизация, агенты, бизнес, заработок)
     AI_KEYWORDS = [
-        "AI automation", "AI workflows", "AI for developers", "AI for startups", 
-        "AI business automation", "AI use cases", "AI agents", "AI coding tools", 
-        "AI developer tools", "AI productivity tools", "vibe coding", "Flux workflow", 
-        "Midjourney", "ComfyUI workflow", "AI thumbnails", "AI short videos", 
-        "AI reels automation", "AI YouTube automation", "AI reels workflow", 
-        "multi-agent systems", "AI research agents", "ИИ автоматизация", "AI автоматизация бизнеса", "ИИ для программистов", "ИИ для разработки", 
-        "AI инструменты", "ИИ для продуктивности", "AI дизайн", "AI для соцсетей", "AI агенты",
+        # Агенты и автоматизация
+        "AI agents", "AI agent", "autonomous agents", "multi-agent",
+        "AI automation", "business automation", "workflow automation",
+        "AI workflows", "n8n automation", "Zapier AI", "Make.com AI",
+        # Бизнес и применение
+        "AI for business", "AI for startups", "AI use cases",
+        "AI for sales", "AI for marketing", "AI customer support",
+        "AI productivity", "AI operations", "AI SaaS",
+        # Создание продукта и монетизация
+        "build AI SaaS", "AI startup ideas", "AI micro SaaS",
+        "indie hacker AI", "AI side project", "monetize with AI",
+        "AI coding agents", "Claude Code", "Cursor AI", "vibe coding",
+        "AI developer tools",
+        # Новые инструменты в разработке и автоматизации — без имён продуктов
+        "new AI agent tool", "new AI developer tool", "new AI automation tool",
+        "emerging AI agents", "open source AI agents", "agent framework",
+        "AI tools for developers", "AI agent setup", "configuring AI agents",
+        # Русскоязычные
+        "ИИ агенты", "ИИ автоматизация", "автоматизация бизнеса",
+        "ИИ для бизнеса", "нейросети для бизнеса", "ИИ стартап",
+        "ИИ для продаж", "ИИ для маркетинга", "заработок на ИИ",
+        "настройка ИИ агентов", "новые ИИ инструменты", "ИИ агенты для разработки",
     ]
-    
-    # Исключаемые слова
+
+    # Исключаем академию и «пустые» анонсы без практики
     EXCLUDE_KEYWORDS = [
-        "paper", "research paper", "dataset", "loss function", 
-        "training method", "backpropagation", "gradient descent", 
-        "model weights", "benchmark", "arxiv.org"
+        "research paper", "arxiv.org", "dataset", "loss function",
+        "backpropagation", "gradient descent", "model weights",
+        "benchmark leaderboard", "training method", "ablation study",
+        "parameters released", "weights released",
     ]
-    
+
     # Хэштеги для Twitter
     TWITTER_HASHTAGS = [
-        "#ai", "#chatgpt", "#openai", "#artificialintelligence", 
-        "#stablediffusion", "#generativeai"
+        "#AIagents", "#AIautomation", "#buildinpublic",
+        "#indiehacker", "#SaaS", "#n8n", "#ChatGPT",
     ]
-    
-    # Сабреддиты для Reddit (дайджест об ИИ)
+
+    # Сабреддиты: больше практики и бизнеса, меньше чистого research-hype
     REDDIT_SUBREDDITS = [
-        "MachineLearning", "Artificial", "ChatGPT", "OpenAI", "StableDiffusion",
-        "ClaudeAI", "singularity", "comfyui", "ChatGPTCoding", "Automate",
+        "ChatGPT", "ChatGPTCoding", "ClaudeAI", "OpenAI",
+        "Automate", "n8n", "LocalLLaMA",
+        "SaaS", "indiehackers", "startups", "Entrepreneur",
+        "Artificial", "singularity",
+        # Здесь чаще всего постят новые агентные инструменты, без привязки к одному продукту
+        "AI_Agents",
     ]
 
-    # Сабреддиты для отдельного бизнес-дайджеста (команда --reddit-business)
+    # Сабреддиты для --reddit-business: идеи, истории запуска, side projects (не общая бизнес-пресса)
     REDDIT_BUSINESS_SUBREDDITS = [
-        "Entrepreneur", "startups", "smallbusiness", "business", "EntrepreneurRideAlong",
-        "SideProject", "startup_ideas", "Business_Ideas", "Entrepreneurship", "Ideas",
-        "SomebodyMakeThis", "AppIdeas", "SaaS", "microsaas", "indiehackers",
-        "passive_income", "sidehustle", "WorkOnline", "digitalnomad", "ecommerce",
-        "dropshipping", "Affiliatemarketing", "juststart", "sweatystartup", "EntrepreneurUK",
-        "growthhacking", "marketing", "freelance", "startupideas", "EntrepreneurshipStudents",
+        "startup_ideas", "Business_Ideas", "startupideas", "SomebodyMakeThis", "AppIdeas",
+        "SideProject", "indiehackers", "SaaS", "microsaas", "sweatystartup", "juststart",
+        "EntrepreneurRideAlong", "Entrepreneur", "startups", "smallbusiness", "Entrepreneurship",
+        "sidehustle", "EntrepreneurUK", "EntrepreneurshipStudents", "alphaandbetausers",
     ]
 
-    # Минимум апвотов, чтобы отсечь совсем незаметные посты
-    REDDIT_BUSINESS_MIN_SCORE = int(os.getenv("REDDIT_BUSINESS_MIN_SCORE", "5"))
+    # Сабы, где почти всё — идеи: достаточно отсутствия спама (без жёсткого keyword-match)
+    REDDIT_BUSINESS_IDEA_SUBREDDITS = {
+        "startup_ideas", "business_ideas", "startupideas", "somebodymakethis",
+        "appideas", "sideproject", "alphaandbetausers",
+    }
 
-    # Сколько «топовых за день» постов запрашивать с каждого саба (потом режем по max_results)
-    REDDIT_BUSINESS_TOP_PER_SUB = int(os.getenv("REDDIT_BUSINESS_TOP_PER_SUB", "12"))
+    # Идеи / истории создания / решаемые проблемы (онлайн и оффлайн)
+    REDDIT_BUSINESS_IDEA_KEYWORDS = [
+        "business idea", "startup idea", "app idea", "saas idea", "product idea",
+        "side hustle idea", "side project", "niche idea", "service idea",
+        "idea:", "[idea]", "[ideas]", "idea for", "ideas for",
+        "somebody make", "would anyone pay", "would you pay", "looking for feedback",
+        "validate", "validation", "pain point", "problem i", "problem we",
+        "solved a problem", "solving a problem", "customer problem", "market gap",
+        "i built", "i launched", "i started", "i founded", "i created", "i made a",
+        "we built", "we launched", "we started", "how i built", "how i started",
+        "how we built", "how i made", "my journey", "founder story", "origin story",
+        "case study", "lessons learned", "from 0 to", "from idea to", "bootstrapped",
+        "started a business", "built a business", "launched a", "launched my",
+        "first customer", "first sale", "first clients", "hit $", "mrr", "arr",
+        "revenue update", "making money with", "turned into a business",
+        "offline business", "online business", "local business", "brick and mortar",
+        "ecommerce store", "e-commerce", "agency", "freelance business",
+        "what if", "unmet need", "underserved", "mvp", "build in public",
+        "бизнес идея", "идея для бизнеса", "стартап идея", "запустил бизнес",
+        "создал бизнес", "история запуска", "как я запустил", "решил проблему",
+        "идея приложения", "side hustle",
+    ]
+
+    # Спам, вакансии, курсы «быстрых денег», общая финансовая пресса
+    REDDIT_BUSINESS_EXCLUDE_KEYWORDS = [
+        "we're hiring", "we are hiring", "hiring:", "job opening", "looking for employees",
+        "resume review", "looking for a job", "job offer",
+        "buy my course", "my course", "coaching call", "1:1 coaching", "mentorship program",
+        "dropshipping course", "get rich quick", "make money fast", "guaranteed income",
+        "crypto signal", "nft drop", "pump and dump", "day trading", "stock tip",
+        "upvote if", "free giveaway", "onlyfans",
+        "fed rate", "interest rate hike", "stock market crash", "recession news",
+    ]
+
+    # Минимум апвотов — идеи, которые уже «зашли» людям
+    REDDIT_BUSINESS_MIN_SCORE = int(os.getenv("REDDIT_BUSINESS_MIN_SCORE", "10"))
+
+    # Сколько топовых постов за неделю брать с каждого саба (потом режем по max_results)
+    REDDIT_BUSINESS_TOP_PER_SUB = int(os.getenv("REDDIT_BUSINESS_TOP_PER_SUB", "15"))
 
     # Период и метрики "топа" для дайджеста
     NEWS_LOOKBACK_DAYS = int(os.getenv("NEWS_LOOKBACK_DAYS", "7"))
-    YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
-    YOUTUBE_MAX_RESULTS_PER_QUERY = int(os.getenv("YOUTUBE_MAX_RESULTS_PER_QUERY", "12"))
-    YOUTUBE_MIN_VIEWS = int(os.getenv("YOUTUBE_MIN_VIEWS", "50000"))
+    # Сколько материалов с наивысшим рейтингом уходит в Telegram
+    DIGEST_MAX_ITEMS = int(os.getenv("DIGEST_MAX_ITEMS", "40"))
+
+    # Сигналы «можно применить в бизнесе / для заработка» (скоринг)
+    PRACTICAL_KEYWORDS = [
+        "automat", "agent", "workflow", "n8n", "zapier", "make.com",
+        "business", "startup", "saas", "use case", "tutorial", "how to",
+        "build", "productivity", "sales", "marketing", "customer support",
+        "revenue", "monetiz", "indie", "side project", "freelance",
+        "no-code", "nocode", "playbook", "case study",
+        "framework", "open source", "open-source", "developer tool",
+        "setup", "configure",
+        "автоматиз", "агент", "бизнес", "стартап", "заработ", "продаж",
+        "маркетинг", "как сделать", "как внедрить", "кейс", "настройк",
+    ]
+
+    # Штраф только за анонсы моделей. Запуск нового инструмента или фреймворка не режем:
+    # как раз так находятся технологии, которых ещё нет в списке ключевых слов.
+    ANNOUNCEMENT_PENALTY_KEYWORDS = [
+        "introducing gpt", "releases model", "new model release",
+        "drops model", "model weights", "weights released",
+        "parameters released", "frontier model", "new llm",
+        "анонсировал модель", "представил модель", "выпустил модель",
+    ]
     
     @classmethod
     def validate_config(cls):
@@ -115,12 +184,6 @@ class Config:
         
         if cls.ENABLE_REDDIT and (not cls.REDDIT_CLIENT_ID or not cls.REDDIT_CLIENT_SECRET):
             errors.append("Reddit API credentials не установлены, но Reddit включен")
-
-        if cls.ENABLE_YOUTUBE and not cls.YOUTUBE_API_KEY:
-            errors.append("YOUTUBE_API_KEY не установлен, но YouTube включен")
-
-        if not cls.GEMINI_API_KEY:
-            errors.append("GEMINI_API_KEY не установлен (нужен для генерации выжимок статей)")
         
         if errors:
             raise ValueError("Ошибки конфигурации:\n" + "\n".join(errors))

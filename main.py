@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 
 # Добавляем текущую директорию в путь для импортов
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -16,65 +16,58 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils.config import Config, setup_logging
 from utils.filters import NewsFilter
 from utils.telegram_sender import TelegramSender
-from utils.summarizer import ArticleSummarizer
 from sources.twitter_parser import TwitterParser
 from sources.google_news_parser import GoogleNewsParser
 from sources.hackernews_parser import HackerNewsParser
 from sources.reddit_parser import RedditParser
-from sources.youtube_parser import YouTubeParser
 
 class AINewsAggregator:
     """Основной класс агрегатора новостей об ИИ"""
     
-    def __init__(self):
+    def __init__(self, enabled_sources: Optional[List[str]] = None):
         self.config = Config()
         self.filter = NewsFilter()
         self.telegram_sender = TelegramSender()
-        # Суммаризатор включаем только если это разрешено в конфиге
-        self.summarizer = ArticleSummarizer() if self.config.ENABLE_SUMMARIZER else None
         self.logger = logging.getLogger(__name__)
         
-        # Инициализируем парсеры
+        # Инициализируем парсеры (все или только выбранные для CLI-режима)
         self.parsers = {}
-        self._initialize_parsers()
+        self._initialize_parsers(enabled_sources)
     
-    def _initialize_parsers(self):
-        """Инициализирует парсеры для доступных источников"""
+    def _initialize_parsers(self, enabled_sources: Optional[List[str]] = None):
+        """Инициализирует парсеры. Если enabled_sources задан — только эти источники."""
+        wanted: Optional[Set[str]] = set(enabled_sources) if enabled_sources is not None else None
+
+        def _need(source_key: str) -> bool:
+            return wanted is None or source_key in wanted
         
         try:
-            if self.config.ENABLE_TWITTER:
+            if _need('twitter') and self.config.ENABLE_TWITTER:
                 self.parsers['twitter'] = TwitterParser()
                 self.logger.info("Twitter парсер инициализирован")
         except Exception as e:
             self.logger.error(f"Ошибка инициализации Twitter парсера: {e}")
         
         try:
-            if self.config.ENABLE_GOOGLE_NEWS:
+            if _need('google_news') and self.config.ENABLE_GOOGLE_NEWS:
                 self.parsers['google_news'] = GoogleNewsParser()
                 self.logger.info("Google News парсер инициализирован")
         except Exception as e:
             self.logger.error(f"Ошибка инициализации Google News парсера: {e}")
         
         try:
-            if self.config.ENABLE_HACKERNEWS:
+            if _need('hackernews') and self.config.ENABLE_HACKERNEWS:
                 self.parsers['hackernews'] = HackerNewsParser()
                 self.logger.info("Hacker News парсер инициализирован")
         except Exception as e:
             self.logger.error(f"Ошибка инициализации Hacker News парсера: {e}")
         
         try:
-            if self.config.ENABLE_REDDIT:
+            if _need('reddit') and self.config.ENABLE_REDDIT:
                 self.parsers['reddit'] = RedditParser()
                 self.logger.info("Reddit парсер инициализирован")
         except Exception as e:
             self.logger.error(f"Ошибка инициализации Reddit парсера: {e}")
-
-        try:
-            if self.config.ENABLE_YOUTUBE:
-                self.parsers['youtube'] = YouTubeParser()
-                self.logger.info("YouTube парсер инициализирован")
-        except Exception as e:
-            self.logger.error(f"Ошибка инициализации YouTube парсера: {e}")
     
     def collect_news(self) -> List[Dict[str, Any]]:
         """Собирает новости из всех доступных источников"""
@@ -131,18 +124,6 @@ class AINewsAggregator:
                 error_msg = f"Reddit: {str(e)}"
                 errors.append(error_msg)
                 self.logger.error(error_msg)
-
-        # YouTube
-        if 'youtube' in self.parsers:
-            try:
-                youtube_news = self.parsers['youtube'].search_videos(max_results=50)
-                all_news.extend(youtube_news)
-                sources_used.append('YouTube')
-                self.logger.info(f"YouTube: найдено {len(youtube_news)} видео")
-            except Exception as e:
-                error_msg = f"YouTube: {str(e)}"
-                errors.append(error_msg)
-                self.logger.error(error_msg)
         
         self.logger.info(f"Всего собрано {len(all_news)} новостей из {len(sources_used)} источников")
         
@@ -156,8 +137,8 @@ class AINewsAggregator:
         unique_news = self.filter.remove_duplicates(news_list)
         self.logger.info(f"После удаления дубликатов: {len(unique_news)} новостей")
         
-        # Фильтруем по релевантности
-        relevant_news = self.filter.filter_news_by_relevance(unique_news, min_score=10)
+        # Фильтруем по релевантности (практика/бизнес важнее анонсов)
+        relevant_news = self.filter.filter_news_by_relevance(unique_news, min_score=20)
         self.logger.info(f"После фильтрации по релевантности: {len(relevant_news)} новостей")
         
         # Сортируем по итоговому рейтингу (релевантность + популярность),
@@ -172,16 +153,30 @@ class AINewsAggregator:
             key=lambda x: (x.get("ranking_score", 0), _published_ts(x)),
             reverse=True,
         )
+
+        before_similar = len(relevant_news)
+        relevant_news = self.filter.drop_similar_titles(relevant_news)
+        if len(relevant_news) < before_similar:
+            self.logger.info(
+                "Убраны похожие заголовки: %s → %s",
+                before_similar,
+                len(relevant_news),
+            )
+
+        max_items = self.config.DIGEST_MAX_ITEMS
+        if len(relevant_news) > max_items:
+            self.logger.info("Оставляем топ-%s из %s по рейтингу", max_items, len(relevant_news))
+            relevant_news = relevant_news[:max_items]
         
         return relevant_news
 
     def process_business_reddit(self, posts: List[Dict[str, Any]], max_items: int = 50) -> List[Dict[str, Any]]:
-        """Посты бизнес-Reddit: язык и сортировка по популярности (score)."""
-        self.logger.info("Обрабатываем бизнес-посты Reddit...")
+        """Посты Reddit: идеи бизнеса / истории запуска, язык, популярность."""
+        self.logger.info("Обрабатываем посты про бизнес-идеи...")
         unique_posts = self.filter.remove_duplicates(posts)
         self.logger.info(f"После удаления дубликатов: {len(unique_posts)} постов")
         filtered = self.filter.filter_business_reddit_posts(unique_posts, max_items=max_items)
-        self.logger.info(f"После фильтра по языку и среза: {len(filtered)} постов")
+        self.logger.info(f"После фильтра идей/языка и среза: {len(filtered)} постов")
         return filtered
 
     def send_news_digest(
@@ -194,7 +189,7 @@ class AINewsAggregator:
         item_emoji: str = "🧠",
         summary_run_name: str = "AI News Aggregator",
     ):
-        """Отправляет новости в Telegram: каждую статью отдельным сообщением с выжимкой."""
+        """Отправляет новости в Telegram: каждую статью отдельным сообщением."""
         try:
             if not news_list:
                 message = (
@@ -208,37 +203,14 @@ class AINewsAggregator:
 
             for news in news_list:
                 title = news.get("title", "Без заголовка")
-                description = news.get("description", "")
                 url = news.get("url", "#")
                 source = news.get("source", "Неизвестный источник")
 
-                summary = None
-
-                # Если суммаризация включена и суммаризатор инициализирован — пробуем получить выжимку
-                if self.summarizer is not None:
-                    summary = self.summarizer.summarize_article(
-                        title=title,
-                        description=description,
-                        source=source,
-                        url=url,
-                        max_sentences=10,
-                    )
-
-                if summary is None:
-                    # Отправляем без выжимки, только заголовок и ссылку
-                    message = (
-                        f"{item_emoji} <b>{title}</b>\n\n"
-                        f"Источник: {source}\n"
-                        f"{url}"
-                    )
-                else:
-                    # Сообщение с заголовком и выжимкой
-                    message = (
-                        f"{item_emoji} <b>{title}</b>\n\n"
-                        f"{summary}\n\n"
-                        f"<i>Источник: {source}</i>\n"
-                        f"{url}"
-                    )
+                message = (
+                    f"{item_emoji} <b>{title}</b>\n\n"
+                    f"Источник: {source}\n"
+                    f"{url}"
+                )
 
                 success = self.telegram_sender.send_message(message, parse_mode="HTML")
 
@@ -255,9 +227,9 @@ class AINewsAggregator:
             self.telegram_sender.send_error_message(str(e))
 
     def run_reddit_business(self):
-        """Только Reddit: популярные бизнес-посты за ~7 дней."""
+        """Только Reddit: популярные бизнес-идеи и истории запуска за ~7 дней."""
         try:
-            self.logger.info("Запуск Reddit Business digest...")
+            self.logger.info("Запуск Reddit Business Ideas digest...")
             self.config.validate_config()
             if not self.config.ENABLE_REDDIT:
                 self.logger.error("Reddit отключён в конфиге (ENABLE_REDDIT=false)")
@@ -325,11 +297,6 @@ class AINewsAggregator:
                     "enabled": self.config.ENABLE_REDDIT,
                     "display": "Reddit",
                     "fetcher": lambda: self.parsers["reddit"].search_posts(max_results=50),
-                },
-                "youtube": {
-                    "enabled": self.config.ENABLE_YOUTUBE,
-                    "display": "YouTube",
-                    "fetcher": lambda: self.parsers["youtube"].search_videos(max_results=50),
                 },
             }
 
@@ -419,8 +386,6 @@ class AINewsAggregator:
                     test_news = parser.search_stories(max_results=1)
                 elif source_name == 'reddit':
                     test_news = parser.search_posts(max_results=1)
-                elif source_name == 'youtube':
-                    test_news = parser.search_videos(max_results=1)
                 
                 self.logger.info(f"✅ {source_name}: OK")
                 
@@ -433,31 +398,38 @@ def main():
     logger = setup_logging()
     
     try:
-        # Создаем агрегатор
-        aggregator = AINewsAggregator()
-        
-        # Проверяем аргументы командной строки
-        if len(sys.argv) > 1 and sys.argv[1] == '--test':
+        cli_arg = sys.argv[1] if len(sys.argv) > 1 else None
+
+        # Какие парсеры поднимать: None = все включённые в .env
+        sources_by_mode = {
+            "--reddit-only": ["reddit"],
+            "--google-hn": ["google_news", "hackernews"],
+            # Reddit Business создаёт свой RedditParser внутри метода
+            "--reddit-business": [],
+        }
+        enabled_sources = sources_by_mode.get(cli_arg) if cli_arg else None
+
+        aggregator = AINewsAggregator(enabled_sources=enabled_sources)
+
+        if cli_arg == "--test":
             aggregator.test_sources()
             return
 
-        if len(sys.argv) > 1 and sys.argv[1] == '--reddit-business':
+        if cli_arg == "--reddit-business":
             aggregator.run_reddit_business()
             return
 
-        if len(sys.argv) > 1 and sys.argv[1] == '--youtube-only':
-            aggregator.run_selected_sources(["youtube"], digest_title="YouTube AI Digest")
-            return
-
-        if len(sys.argv) > 1 and sys.argv[1] == '--reddit-only':
+        if cli_arg == "--reddit-only":
             aggregator.run_selected_sources(["reddit"], digest_title="Reddit AI Digest")
             return
 
-        if len(sys.argv) > 1 and sys.argv[1] == '--google-hn':
-            aggregator.run_selected_sources(["google_news", "hackernews"], digest_title="Google + Hacker News AI Digest")
+        if cli_arg == "--google-hn":
+            aggregator.run_selected_sources(
+                ["google_news", "hackernews"],
+                digest_title="Google + Hacker News AI Digest",
+            )
             return
-        
-        # Запускаем агрегатор
+
         aggregator.run()
         
     except KeyboardInterrupt:

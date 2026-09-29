@@ -118,15 +118,6 @@ def example_source_specific():
             sources.append(('Google News', len(google_news)))
         except Exception as e:
             sources.append(('Google News', f"Ошибка: {e}"))
-
-    if config.ENABLE_YOUTUBE:
-        try:
-            from sources.youtube_parser import YouTubeParser
-            youtube_parser = YouTubeParser()
-            youtube_news = youtube_parser.search_videos(max_results=5)
-            sources.append(('YouTube', len(youtube_news)))
-        except Exception as e:
-            sources.append(('YouTube', f"Ошибка: {e}"))
     
     # Выводим результаты
     for source_name, result in sources:

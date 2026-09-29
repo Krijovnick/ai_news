@@ -20,10 +20,20 @@ class GoogleNewsParser:
         news_items = []
         
         try:
-            # Поиск по каждому ключевому слову
-            for keyword in self.config.AI_KEYWORDS[:20]:  # Ограничиваем количество запросов
+            # Сначала запросы про новые инструменты, затем общий список ИИ
+            keywords = []
+            seen = set()
+            for keyword in list(self.config.DISCOVERY_KEYWORDS) + list(self.config.AI_KEYWORDS[:20]):
+                key = keyword.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                keywords.append(keyword)
+
+            per_keyword = max(3, max_results // 8)
+            for keyword in keywords:
                 try:
-                    keyword_news = self._search_by_keyword(keyword, max_results // len(self.config.AI_KEYWORDS[:8]))
+                    keyword_news = self._search_by_keyword(keyword, per_keyword)
                     news_items.extend(keyword_news)
                     
                     self.logger.info(f"Найдено {len(keyword_news)} новостей для ключевого слова: {keyword}")
@@ -49,13 +59,21 @@ class GoogleNewsParser:
         try:
             # Формируем URL для RSS фида Google News
             # Используем разные регионы для получения большего количества новостей
-            regions = ['US', 'GB', 'CA', 'AU']
-            
-            for region in regions:
+            # Русские запросы ищем в RU, остальные — в англоязычных регионах
+            if any("а" <= ch <= "я" or ch == "ё" for ch in keyword.lower()):
+                feeds = [("ru", "RU", "RU")]
+            else:
+                feeds = [("en", region, region) for region in ("US", "GB", "CA", "AU")]
+
+            for hl, gl, ceid in feeds:
+                region = gl
                 try:
                     # URL для RSS фида Google News (кодируем ключевое слово)
                     encoded_keyword = quote_plus(keyword)
-                    rss_url = f"https://news.google.com/rss/search?q={encoded_keyword}&hl=en-{region}&gl={region}&ceid={region}:en"
+                    rss_url = (
+                        f"https://news.google.com/rss/search?q={encoded_keyword}"
+                        f"&hl={hl}-{region}&gl={gl}&ceid={ceid}:{hl}"
+                    )
                     
                     # Парсим RSS фид
                     feed = feedparser.parse(rss_url)

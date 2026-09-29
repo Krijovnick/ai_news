@@ -40,6 +40,9 @@ class RedditParser:
                     self.logger.error(f"Ошибка при поиске в r/{subreddit_name}: {e}")
                     continue
             
+            # Дополнительно: новые инструменты для агентов и автоматизации
+            posts.extend(self._search_discovery_posts())
+
             # Удаляем дубликаты
             posts = self.filter.remove_duplicates(posts)
             posts.sort(key=lambda x: (x.get("score", 0), x.get("comments_count", 0)), reverse=True)
@@ -189,6 +192,33 @@ class RedditParser:
             self.logger.error(f"Ошибка при получении трендовых постов: {e}")
             return []
     
+    def _search_discovery_posts(self, limit_per_keyword: int = 8) -> List[Dict[str, Any]]:
+        """Ищет по всему Reddit новые инструменты для агентов и автоматизации."""
+        posts = []
+        keywords = getattr(self.config, "DISCOVERY_KEYWORDS", []) or []
+
+        for keyword in keywords:
+            try:
+                search_results = self.reddit.subreddit("all").search(
+                    keyword, sort="top", time_filter="week", limit=limit_per_keyword
+                )
+                found = 0
+                for post in search_results:
+                    post_data = self._extract_post_data(post)
+                    if not post_data or not self._is_valid_post(post_data):
+                        continue
+                    text = f"{post_data.get('title', '')} {post_data.get('description', '')}"
+                    if not self.filter.matches_discovery(text):
+                        continue
+                    posts.append(post_data)
+                    found += 1
+                self.logger.info("Reddit discovery '%s': %s постов", keyword, found)
+            except Exception as e:
+                self.logger.error("Ошибка поиска Reddit '%s': %s", keyword, e)
+                continue
+
+        return posts
+
     def search_by_keywords(self, max_results: int = 30) -> List[Dict[str, Any]]:
         """Поиск постов по ключевым словам"""
         posts = []
@@ -229,7 +259,7 @@ class RedditParser:
             return []
 
     def _is_valid_business_post(self, post_data: Dict[str, Any]) -> bool:
-        """Пост для бизнес-дайджеста: без фильтра по ИИ-ключевым словам."""
+        """Пост про бизнес-идеи / истории запуска; без фильтра по ИИ."""
         if not post_data:
             return False
         title = (post_data.get("title") or "").strip()
@@ -241,12 +271,12 @@ class RedditParser:
         score = post_data.get("score", 0)
         if score < self.config.REDDIT_BUSINESS_MIN_SCORE:
             return False
-        return True
+        return self.filter.is_business_idea_post(post_data)
 
     def search_business_posts(self, max_results: int = 50) -> List[Dict[str, Any]]:
         """
-        Популярные посты из бизнес-сабреддитов: top(week) + только за последние 7 дней
-        (фильтр даты в _extract_post_data).
+        Популярные посты про бизнес-идеи и истории запуска:
+        top(week) по сабам + фильтр по ключевым словам / idea-сабам.
         """
         posts: List[Dict[str, Any]] = []
         subs = self.config.REDDIT_BUSINESS_SUBREDDITS
@@ -263,7 +293,7 @@ class RedditParser:
                         if post_data and self._is_valid_business_post(post_data):
                             posts.append(post_data)
                     self.logger.debug(
-                        "Бизнес Reddit: r/%s (top за неделю, limit=%s)",
+                        "Бизнес-идеи Reddit: r/%s (top за неделю, limit=%s)",
                         subreddit_name,
                         limit_per_sub,
                     )
@@ -272,10 +302,18 @@ class RedditParser:
                     continue
 
             posts = self.filter.remove_duplicates(posts)
-            posts.sort(key=lambda x: x.get("score", 0), reverse=True)
+            posts.sort(
+                key=lambda x: (
+                    self.filter.business_idea_relevance(x),
+                    x.get("score", 0),
+                ),
+                reverse=True,
+            )
             if len(posts) > max_results:
                 posts = posts[:max_results]
-            self.logger.info("Бизнес Reddit: всего уникальных постов после среза: %s", len(posts))
+            self.logger.info(
+                "Бизнес-идеи Reddit: уникальных постов после среза: %s", len(posts)
+            )
             return posts
         except Exception as e:
             self.logger.error("Ошибка search_business_posts: %s", e)
