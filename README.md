@@ -1,39 +1,37 @@
 # AI News Aggregator
 
-Агрегатор новостей из Twitter, Google News, Hacker News и Reddit с отправкой дайджеста в Telegram.
+Недельный сбор материалов про ИИ, разбор и статьи через DeepSeek в SQLite, чтение на локальном сайте. Что программа должна делать — в [базе знаний](docs/knowledge-base/README.md).
 
 ## Запуск двойным кликом (Windows)
 
-В корне проекта лежат `.bat`-файлы. Откройте папку `C:\myPets\AI_news` в Проводнике и дважды кликните нужный файл:
-
 | Файл | Что делает |
 |------|------------|
-| `Reddit.bat` | Только Reddit: топовые AI-посты за последние 7 дней, отправка в Telegram. |
-| `Google_HN.bat` | Google News + Hacker News: объединённый AI-дайджест за последние 7 дней. |
-| `Reddit_Business.bat` | Только Reddit — бизнес-идеи и истории запуска; Telegram как **Reddit Business Digest**. |
+| `Collect.bat` | Полный недельный прогон (`python main.py`). |
+| `Web.bat` | Сайт `http://127.0.0.1:5050` (`python web.py`). |
 
-Окно консоли откроется само, скрипт отработает, в конце нажмите любую клавишу, чтобы закрыть.
+Окно консоли остаётся открытым до нажатия клавиши.
 
 ## Команды
 
-Запускать из корня проекта (где лежит `main.py`), с настроенным `.env`.
+Запускать из корня проекта с настроенным `.env`.
 
 | Команда | Что делает |
 |--------|------------|
-| `python main.py` | Полный прогон: сбор топовых новостей и постов об ИИ за последние 7 дней из всех включённых в `.env` источников, фильтрация и отправка в Telegram. |
-| `python main.py --reddit-only` | Режим только Reddit: топовые AI-посты за последние 7 дней, отправка в Telegram. То же, что `Reddit.bat`. |
-| `python main.py --google-hn` | Режим Google News + Hacker News: объединённый AI-дайджест только из этих двух источников за последние 7 дней. То же, что `Google_HN.bat`. |
-| `python main.py --test` | Проверка источников: по одному запросу к каждому включённому парсеру (Twitter, Google News, Hacker News, Reddit). Логи в консоль и в `logs/app.log`. |
-| `python main.py --reddit-business` | Отдельный режим: только Reddit — бизнес-идеи (онлайн/оффлайн), истории запуска и решаемые проблемы; сабы + keyword-фильтр из конфига; популярные посты за ~7 дней; Telegram как **Reddit Business Digest**. То же, что `Reddit_Business.bat`. |
-| `python scheduler.py` | Фоновый планировщик: периодически вызывает тот же сценарий, что и `python main.py` (полный агрегатор). Расписание задаётся в `scheduler.py` (по умолчанию 09:00 и 18:00). |
-| `python test_aggregator.py` | Локальные проверки: конфиг, фильтры, Telegram (тестовое сообщение), быстрый опрос парсеров. |
-| `python example_usage.py` | Демонстрационные сценарии из `example_usage.py` (не продакшен-запуск). |
-| `python install.py` | Первичная установка: зависимости из `requirements.txt`, каталоги и т.п. |
+| `python main.py` | Полный прогон: сбор за последние `NEWS_LOOKBACK_DAYS` дней, фильтр, DeepSeek, запись в `data/news.db`, одно уведомление в Telegram. |
+| `python main.py --test` | Проверка источников без Telegram и без записи разбора в базу. |
+| `python web.py` | Веб-интерфейс разборов и ключевых слов на `http://127.0.0.1:5050`. |
+| `python test_aggregator.py` | Локальные проверки без сети и боевого Telegram. |
+| `python install.py` | Зависимости и каталоги `logs`, `data`. |
+
+Интерфейс на Vue; пересборка — `npm run build` в каталоге `frontend/`.
+
+Неизвестный аргумент `main.py` завершает процесс с кодом 2, без сбора.
 
 ## Переменные окружения
 
-Секреты и флаги источников задаются в `.env`. См. `utils/config.py` для полного списка опций (Telegram, Reddit, `ENABLE_*` для источников и др.).
+Секреты и флаги задаются в `.env` (имена в `utils/config.py`): Telegram, Reddit, `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`, `ARTICLES_PER_RUN`, `ENABLE_*` для источников.
 
-## Логи
+## Логи и данные
 
-Логи пишутся в каталог `logs/` (например `logs/app.log`).
+- Логи: `logs/app.log`
+- База: `data/` (в `.gitignore`)

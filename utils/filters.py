@@ -1,155 +1,220 @@
 import math
 import re
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Sequence
 from utils.config import Config
+
 
 class NewsFilter:
     """Класс для фильтрации новостей"""
-    
-    def __init__(self):
+
+    def __init__(self, active_keywords: Optional[Sequence[str]] = None):
         self.config = Config()
-    
+        self.active_keywords: List[str] = list(active_keywords) if active_keywords is not None else []
+
+    def set_active_keywords(self, keywords: Sequence[str]) -> None:
+        self.active_keywords = list(keywords)
+
     def is_recent_news(self, published_date: datetime, hours: int = 24) -> bool:
         """Проверяет, является ли новость свежей (за последние N часов)"""
         if not published_date:
             return False
-        
+
         from datetime import timezone
+
         now = datetime.now(timezone.utc)
         cutoff_time = now - timedelta(hours=hours)
-        
+
         if published_date.tzinfo is None:
             published_date = published_date.replace(tzinfo=timezone.utc)
-        
-        return published_date >= cutoff_time
-    
-    def contains_ai_keywords(self, text: str) -> bool:
-        """Проверяет, содержит ли текст ключевые слова об ИИ"""
-        if not text:
-            return False
-        
-        text_lower = text.lower()
-        
-        has_ai_keywords = any(keyword.lower() in text_lower for keyword in self.config.AI_KEYWORDS)
-        
-        has_exclude_keywords = any(keyword.lower() in text_lower for keyword in self.config.EXCLUDE_KEYWORDS)
-        
-        return has_ai_keywords and not has_exclude_keywords
 
-    def matches_discovery(self, text: str) -> bool:
-        """Новый инструмент, фреймворк или способ автоматизации — без привязки к известному продукту."""
+        return published_date >= cutoff_time
+
+    def has_exclude_keywords(self, text: str) -> bool:
         if not text:
             return False
         text_lower = text.lower()
-        keywords = getattr(self.config, "DISCOVERY_KEYWORDS", []) or []
-        return any(keyword.lower() in text_lower for keyword in keywords)
-    
-    def is_retweet(self, text: str) -> bool:
-        """Проверяет, является ли твит ретвитом"""
-        return text.startswith('RT @') or text.startswith('rt @')
-    
+        return any(keyword.lower() in text_lower for keyword in self.config.EXCLUDE_KEYWORDS)
+
+    def matches_active_keywords(self, text: str) -> bool:
+        if not text or not self.active_keywords:
+            return False
+        text_lower = text.lower()
+        for keyword in self.active_keywords:
+            kw = keyword.lower()
+            if len(kw) <= 3:
+                if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", text_lower, flags=re.UNICODE):
+                    return True
+            elif kw in text_lower:
+                return True
+        return False
+
+    def has_explicit_ai_sense(self, text: str) -> bool:
+        if not text:
+            return False
+        text_lower = text.lower()
+        for marker in self.config.AI_SENSE_MARKERS:
+            m = marker.lower()
+            # Короткие маркеры — только как отдельное слово (не «said» / «email»)
+            if len(m) <= 3:
+                if re.search(rf"(?<!\w){re.escape(m)}(?!\w)", text_lower, flags=re.UNICODE):
+                    return True
+            elif m in text_lower:
+                return True
+        return False
+
+    def contains_ai_keywords(self, text: str) -> bool:
+        """Есть active-ключевое слово (или явный ИИ-смысл) и нет exclude."""
+        if not text:
+            return False
+        if self.has_exclude_keywords(text):
+            return False
+        return self.matches_active_keywords(text) or self.has_explicit_ai_sense(text)
+
     def clean_text(self, text: str) -> str:
-        """Очищает текст от лишних символов"""
         if not text:
             return ""
-        
-        text = re.sub(r'\s+', ' ', text)
-        text = text.strip()
-        
-        return text
-    
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
     def extract_keywords_from_text(self, text: str) -> List[str]:
-        """Извлекает ключевые слова из текста"""
-        if not text:
+        if not text or not self.active_keywords:
             return []
-        
         text_lower = text.lower()
-        found_keywords = []
-        
-        for keyword in self.config.AI_KEYWORDS:
+        found = []
+        for keyword in self.active_keywords:
             if keyword.lower() in text_lower:
-                found_keywords.append(keyword)
-        
-        return found_keywords
-    
+                found.append(keyword)
+        return found
+
     def is_english_or_russian(self, text: str) -> bool:
-        """Проверяет, является ли текст на английском или русском языке"""
         if not text:
             return False
-        
-        cyrillic_count = len(re.findall(r'[а-яё]', text.lower()))
-        latin_count = len(re.findall(r'[a-z]', text.lower()))
-        
+
+        cyrillic_count = len(re.findall(r"[а-яё]", text.lower()))
+        latin_count = len(re.findall(r"[a-z]", text.lower()))
         unwanted_chars = len(re.findall(r'[^\w\s\-.,!?()\[\]":;@#$%^&*+=<>/\\|`~]', text))
-        
         total_letters = cyrillic_count + latin_count
-        total_chars = len(re.findall(r'[^\s]', text))  # Все не-пробельные символы
-        
+
         if total_letters == 0:
             return False
-        
         if unwanted_chars > 0:
             return False
-        
+
         cyrillic_ratio = cyrillic_count / total_letters
         latin_ratio = latin_count / total_letters
-        
         return total_letters >= 3 and (cyrillic_ratio > 0.8 or latin_ratio > 0.8)
-    
+
+    def title_letters_are_ru_or_en(self, text: str) -> bool:
+        """Русский или английский по буквам. Пунктуация заголовок не отбрасывает.
+
+        Доля кириллицы или латиницы считается среди всех букв, не меньше 3.
+        Одна из долей должна быть больше 0.8. Для собранных новостей по-прежнему
+        используется is_english_or_russian.
+        """
+        if not text:
+            return False
+        letters = [ch for ch in text if ch.isalpha()]
+        total = len(letters)
+        if total < 3:
+            return False
+        cyrillic = 0
+        latin = 0
+        for ch in letters:
+            lower = ch.lower()
+            if ("а" <= lower <= "я") or lower == "ё":
+                cyrillic += 1
+            elif "a" <= lower <= "z":
+                latin += 1
+        return (cyrillic / total > 0.8) or (latin / total > 0.8)
+
     def calculate_relevance_score(self, title: str, description: str = "", keywords: List[str] = None) -> int:
-        """Релевантность: приоритет практике (агенты, автоматизация, бизнес), не анонсам."""
         if not title:
             return 0
 
         score = 0
         text = f"{title} {description}".lower()
 
-        # Высокий приоритет — то, что можно внедрить и монетизировать
         high_priority = [
-            "ai agent", "ai agents", "autonomous agent", "multi-agent",
-            "ai automation", "business automation", "workflow automation",
-            "n8n", "zapier", "make.com", "ai saas", "micro saas",
-            "ai for business", "ai for sales", "ai for marketing",
-            "claude code", "cursor ai", "coding agent",
-            "agent framework", "developer tool", "open source ai",
-            "new ai tool", "new ai agent", "emerging ai",
-            "ai agent setup", "configuring ai agents",
-            "ии агент", "автоматизация бизнеса", "ии для бизнеса",
-            "настройка ии агент", "новые ии инструмент",
+            "ai agent",
+            "ai agents",
+            "autonomous agent",
+            "multi-agent",
+            "ai automation",
+            "business automation",
+            "workflow automation",
+            "n8n",
+            "zapier",
+            "make.com",
+            "ai saas",
+            "micro saas",
+            "ai for business",
+            "ai for sales",
+            "ai for marketing",
+            "claude code",
+            "cursor ai",
+            "coding agent",
+            "agent framework",
+            "developer tool",
+            "open source ai",
+            "new ai tool",
+            "new ai agent",
+            "emerging ai",
+            "ai agent setup",
+            "configuring ai agents",
+            "ии агент",
+            "автоматизация бизнеса",
+            "ии для бизнеса",
+            "настройка ии агент",
+            "новые ии инструмент",
         ]
         for keyword in high_priority:
             if keyword in text:
                 score += 22
 
         medium_priority = [
-            "automation", "workflow", "use case", "startup", "saas",
-            "productivity", "no-code", "nocode", "indie hacker",
-            "build with ai", "chatgpt", "claude", "openai",
-            "tutorial", "how to", "playbook", "case study",
-            "framework", "open source", "open-source", "developer tool",
-            "автоматиз", "стартап", "заработ", "кейс", "новый инструмент",
+            "automation",
+            "workflow",
+            "use case",
+            "startup",
+            "saas",
+            "productivity",
+            "no-code",
+            "nocode",
+            "indie hacker",
+            "build with ai",
+            "chatgpt",
+            "claude",
+            "openai",
+            "tutorial",
+            "how to",
+            "playbook",
+            "case study",
+            "framework",
+            "open source",
+            "open-source",
+            "developer tool",
+            "автоматиз",
+            "стартап",
+            "заработ",
+            "кейс",
+            "новый инструмент",
         ]
         for keyword in medium_priority:
             if keyword in text:
                 score += 10
 
-        # Слабый сигнал — общий ИИ без прикладного контекста
         low_priority = ["artificial intelligence", "generative ai", "llm", "gpt-4", "gpt-5", "gemini"]
         for keyword in low_priority:
             if keyword in text:
                 score += 4
 
-        # Доп. буст за явные practical-сигналы из конфига
-        practical_hits = sum(
-            1 for kw in self.config.PRACTICAL_KEYWORDS if kw.lower() in text
-        )
+        practical_hits = sum(1 for kw in self.config.PRACTICAL_KEYWORDS if kw.lower() in text)
         score += min(practical_hits * 6, 30)
 
         if keywords:
             score += min(len(keywords) * 4, 16)
 
-        # Штраф за «просто анонс релиза»
         for phrase in self.config.ANNOUNCEMENT_PENALTY_KEYWORDS:
             if phrase.lower() in text:
                 score -= 28
@@ -157,41 +222,35 @@ class NewsFilter:
 
         return max(0, min(score, 100))
 
-    
     def filter_news_by_relevance(self, news_list: List[Dict[str, Any]], min_score: int = 30) -> List[Dict[str, Any]]:
-        """Фильтрует новости по релевантности и языку"""
         filtered_news = []
-        
+
         for news in news_list:
-            title = news.get('title', '')
-            description = news.get('description', '')
-            keywords = news.get('keywords', [])
+            title = news.get("title", "")
+            description = news.get("description", "")
+            keywords = news.get("keywords", [])
 
             if not self.is_english_or_russian(title):
                 continue
-            
+
             score = self.calculate_relevance_score(title, description, keywords)
 
             if score >= min_score:
-                news['relevance_score'] = score
-                news['popularity_score'] = self.calculate_popularity_score(news)
-                news['ranking_score'] = score * 0.7 + news['popularity_score'] * 0.3
+                news["relevance_score"] = score
+                news["popularity_score"] = self.calculate_popularity_score(news)
+                news["ranking_score"] = score * 0.7 + news["popularity_score"] * 0.3
                 filtered_news.append(news)
-        
-        filtered_news.sort(key=lambda x: x.get('ranking_score', 0), reverse=True)
-        
+
+        filtered_news.sort(key=lambda x: x.get("ranking_score", 0), reverse=True)
         return filtered_news
 
     def calculate_popularity_score(self, news: Dict[str, Any]) -> int:
-        """Единая оценка популярности контента (0-100) для разных источников."""
         if not news:
             return 0
 
         popularity = 0.0
-
         views = float(news.get("view_count", 0) or 0)
         likes = float(news.get("like_count", 0) or 0)
-        # Логарифм, чтобы 100k и 2M просмотров различались (линейный /2000 всё режет в 100)
         if views > 0:
             popularity += min(math.log10(views) * 22, 70)
         if likes > 0:
@@ -201,7 +260,6 @@ class NewsFilter:
         popularity += float(news.get("reply_count", 0) or 0) / 80.0
         popularity += float(news.get("score", 0) or 0) / 8.0
         popularity += float(news.get("comments_count", 0) or 0) / 20.0
-
         return int(min(popularity, 100))
 
     def _business_post_text(self, post: Dict[str, Any]) -> str:
@@ -211,16 +269,16 @@ class NewsFilter:
 
     def _business_subreddit_slug(self, post: Dict[str, Any]) -> str:
         source = (post.get("source") or "").lower()
-        # "Reddit r/startup_ideas" → "startup_ideas"
         if "r/" in source:
             return source.split("r/", 1)[-1].strip()
-        return ""
+        return (post.get("subreddit") or "").lower()
 
-    def is_business_idea_post(self, post: Dict[str, Any]) -> bool:
-        """
-        Идеи бизнеса, истории запуска, решаемые проблемы — не общая бизнес-пресса.
-        В idea-сабах достаточно отсутствия exclude-спама.
-        """
+    def is_offline_business_post(self, post: Dict[str, Any]) -> bool:
+        text = self._business_post_text(post)
+        return any(kw.lower() in text for kw in self.config.REDDIT_OFFLINE_KEYWORDS)
+
+    def is_online_ai_business_post(self, post: Dict[str, Any]) -> bool:
+        """Онлайн-бизнес про ИИ: без спама/офлайна, с ИИ-смыслом или active-ключом."""
         text = self._business_post_text(post)
         if not text.strip():
             return False
@@ -228,52 +286,14 @@ class NewsFilter:
         excludes = getattr(self.config, "REDDIT_BUSINESS_EXCLUDE_KEYWORDS", []) or []
         if any(kw.lower() in text for kw in excludes):
             return False
+        if self.is_offline_business_post(post):
+            return False
+        if self.has_exclude_keywords(text):
+            return False
 
-        sub = self._business_subreddit_slug(post)
-        idea_subs = {
-            s.lower() for s in (getattr(self.config, "REDDIT_BUSINESS_IDEA_SUBREDDITS", set()) or set())
-        }
-        if sub in idea_subs:
-            return True
-
-        keywords = getattr(self.config, "REDDIT_BUSINESS_IDEA_KEYWORDS", []) or []
-        return any(kw.lower() in text for kw in keywords)
-
-    def business_idea_relevance(self, post: Dict[str, Any]) -> int:
-        """Сколько idea-ключевых слов совпало (+бонус за idea-саб)."""
-        text = self._business_post_text(post)
-        keywords = getattr(self.config, "REDDIT_BUSINESS_IDEA_KEYWORDS", []) or []
-        hits = sum(1 for kw in keywords if kw.lower() in text)
-        sub = self._business_subreddit_slug(post)
-        idea_subs = {
-            s.lower() for s in (getattr(self.config, "REDDIT_BUSINESS_IDEA_SUBREDDITS", set()) or set())
-        }
-        if sub in idea_subs:
-            hits += 2
-        return hits
-
-    def filter_business_reddit_posts(
-        self,
-        posts: List[Dict[str, Any]],
-        max_items: int = 50,
-    ) -> List[Dict[str, Any]]:
-        """Идеи/истории + язык; сортировка: релевантность идее, затем Reddit score."""
-        out: List[Dict[str, Any]] = []
-        for post in posts:
-            title = post.get("title", "")
-            if not self.is_english_or_russian(title):
-                continue
-            if not self.is_business_idea_post(post):
-                continue
-            out.append(post)
-        out.sort(
-            key=lambda x: (self.business_idea_relevance(x), x.get("score", 0)),
-            reverse=True,
-        )
-        return out[:max_items]
+        return self.matches_active_keywords(text) or self.has_explicit_ai_sense(text)
 
     def _title_words(self, title: str) -> List[str]:
-        """Слова заголовка без пунктуации — для сравнения начала и конца."""
         text = re.sub(r"[^\w\s]", " ", (title or "").lower(), flags=re.UNICODE)
         return [word for word in text.split() if word]
 
@@ -286,13 +306,11 @@ class NewsFilter:
         return shared
 
     def _edge_is_similar(self, shared: int, shorter: int) -> bool:
-        """Совпадает длинный кусок, либо короче заголовок почти целиком с края."""
         if shared >= 6:
             return True
         return shared >= 4 and shorter > 0 and shared / shorter >= 0.65
 
     def titles_look_similar(self, left_title: str, right_title: str) -> bool:
-        """Похожи, если совпадает начало или конец, а середина может отличаться."""
         left = self._title_words(left_title)
         right = self._title_words(right_title)
         if not left or not right:
@@ -303,7 +321,6 @@ class NewsFilter:
         return self._edge_is_similar(prefix, shorter) or self._edge_is_similar(suffix, shorter)
 
     def drop_similar_titles(self, news_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Убирает похожие заголовки. Список должен быть отсортирован: выше рейтинг — раньше."""
         kept: List[Dict[str, Any]] = []
         for news in news_list:
             title = news.get("title", "")
@@ -313,66 +330,29 @@ class NewsFilter:
         return kept
 
     def remove_duplicates(self, news_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Удаляет дубликаты новостей"""
         seen_titles = set()
         seen_urls = set()
         unique_news = []
-        
+
         for news in news_list:
-            title = news.get('title', '').lower().strip()
-            url = news.get('url', '')
-            
-            # Проверяем дубликаты по заголовку и URL
-            if title not in seen_titles and url not in seen_urls:
+            title = news.get("title", "").lower().strip()
+            url = news.get("url") or ""
+            if not isinstance(url, str):
+                url = str(url)
+            # Пустой URL — не адрес: им нельзя схлопывать разные заголовки.
+            same_url = bool(url.strip()) and url in seen_urls
+            if title not in seen_titles and not same_url:
                 seen_titles.add(title)
-                seen_urls.add(url)
+                if url.strip():
+                    seen_urls.add(url)
                 unique_news.append(news)
-        
         return unique_news
-    
-    def format_news_for_telegram(self, news_list: List[Dict[str, Any]], max_items: int = 20) -> str:
-        """Форматирует новости для отправки в Telegram"""
-        if not news_list:
-            return f"📰 *AI News Digest*\n\nНовостей не найдено за последние {self.config.NEWS_LOOKBACK_DAYS} дней."
-        
-        # Ограничиваем количество новостей
-        news_list = news_list[:max_items]
-        
-        # Получаем текущую дату
-        from datetime import timezone
-        current_date = datetime.now(timezone.utc).strftime("%d %B %Y")
-        
-        # Формируем заголовок
-        header = f"📰 <b>AI News Digest — {current_date}</b>\n\n"
-        
-        # Формируем список новостей
-        news_items = []
-        for i, news in enumerate(news_list, 1):
-            title = news.get('title', 'Без заголовка')
-            url = news.get('url', '#')
-            source = news.get('source', 'Неизвестный источник')
-            content_type = news.get('content_type', '')
-            duration = news.get('duration', 0)
-            
-            # Не обрезаем заголовки - показываем полные названия
-            
-            # Добавляем эмодзи для типа контента Reddit
-            content_emoji = ""
-            if 'Reddit' in source and content_type:
-                emoji_map = {
-                    'image': '🖼️',
-                    'video': '🎥', 
-                    'text': '📝',
-                    'link': '🔗'
-                }
-                content_emoji = emoji_map.get(content_type, '📄')
-                        
-            # Формируем строку с учетом типа контента
-            if content_emoji:
-                news_item = f"🔹 {content_emoji} <a href='{url}'>{title}</a>\nИсточник: {source}"
-            else:
-                news_item = f"🔹 <a href='{url}'>{title}</a>\nИсточник: {source}"
-            
-            news_items.append(news_item)
-        
-        return header + "\n".join(news_items)
+
+
+def build_run_ready_notification(web_url: Optional[str] = None) -> str:
+    """Одно уведомление после успешного прогона: без списка новостей."""
+    url = web_url or Config.WEB_URL
+    return (
+        f"✅ Разбор недели готов.\n"
+        f"Смотреть на {url}"
+    )

@@ -1,148 +1,57 @@
 #!/usr/bin/env python3
 """
-AI News Aggregator - Основной файл
-Собирает новости об ИИ из различных источников и отправляет в Telegram
+AI News Aggregator — полный недельный прогон:
+сбор → фильтр → DeepSeek → SQLite → одно уведомление в Telegram.
 """
+
+from __future__ import annotations
 
 import logging
 import os
 import sys
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-# Добавляем текущую директорию в путь для импортов
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from utils.ssl_trust import use_system_certificates
+
+use_system_certificates()
+
 from utils.config import Config, setup_logging
-from utils.filters import NewsFilter
+from utils.db import NewsDatabase
+from utils.deepseek import DeepSeekClient
+from utils.filters import NewsFilter, build_run_ready_notification
 from utils.telegram_sender import TelegramSender
-from sources.twitter_parser import TwitterParser
-from sources.google_news_parser import GoogleNewsParser
-from sources.hackernews_parser import HackerNewsParser
-from sources.reddit_parser import RedditParser
+
+
+
+MANUAL_SOURCE = "Вручную"
+MANUAL_TITLE_LANGUAGE_ERROR = "Заголовок должен быть на русском или английском"
+
 
 class AINewsAggregator:
-    """Основной класс агрегатора новостей об ИИ"""
-    
-    def __init__(self, enabled_sources: Optional[List[str]] = None):
+    def __init__(self, db: Optional[NewsDatabase] = None):
         self.config = Config()
-        self.filter = NewsFilter()
-        self.telegram_sender = TelegramSender()
+        self.db = db if db is not None else NewsDatabase()
+        self.active_keywords = self.db.get_active_keywords()
+        self.filter = NewsFilter(self.active_keywords)
         self.logger = logging.getLogger(__name__)
-        
-        # Инициализируем парсеры (все или только выбранные для CLI-режима)
-        self.parsers = {}
-        self._initialize_parsers(enabled_sources)
-    
-    def _initialize_parsers(self, enabled_sources: Optional[List[str]] = None):
-        """Инициализирует парсеры. Если enabled_sources задан — только эти источники."""
-        wanted: Optional[Set[str]] = set(enabled_sources) if enabled_sources is not None else None
+        self.telegram_sender: Optional[TelegramSender] = None
 
-        def _need(source_key: str) -> bool:
-            return wanted is None or source_key in wanted
-        
-        try:
-            if _need('twitter') and self.config.ENABLE_TWITTER:
-                self.parsers['twitter'] = TwitterParser()
-                self.logger.info("Twitter парсер инициализирован")
-        except Exception as e:
-            self.logger.error(f"Ошибка инициализации Twitter парсера: {e}")
-        
-        try:
-            if _need('google_news') and self.config.ENABLE_GOOGLE_NEWS:
-                self.parsers['google_news'] = GoogleNewsParser()
-                self.logger.info("Google News парсер инициализирован")
-        except Exception as e:
-            self.logger.error(f"Ошибка инициализации Google News парсера: {e}")
-        
-        try:
-            if _need('hackernews') and self.config.ENABLE_HACKERNEWS:
-                self.parsers['hackernews'] = HackerNewsParser()
-                self.logger.info("Hacker News парсер инициализирован")
-        except Exception as e:
-            self.logger.error(f"Ошибка инициализации Hacker News парсера: {e}")
-        
-        try:
-            if _need('reddit') and self.config.ENABLE_REDDIT:
-                self.parsers['reddit'] = RedditParser()
-                self.logger.info("Reddit парсер инициализирован")
-        except Exception as e:
-            self.logger.error(f"Ошибка инициализации Reddit парсера: {e}")
-    
-    def collect_news(self) -> List[Dict[str, Any]]:
-        """Собирает новости из всех доступных источников"""
-        all_news = []
-        sources_used = []
-        errors = []
-        
-        self.logger.info("Начинаем сбор новостей...")
-        
-        # Twitter
-        if 'twitter' in self.parsers:
-            try:
-                twitter_news = self.parsers['twitter'].search_tweets(max_results=60)
-                all_news.extend(twitter_news)
-                sources_used.append('Twitter')
-                self.logger.info(f"Twitter: найдено {len(twitter_news)} новостей")
-            except Exception as e:
-                error_msg = f"Twitter: {str(e)}"
-                errors.append(error_msg)
-                self.logger.error(error_msg)
-        
-        # Google News
-        if 'google_news' in self.parsers:
-            try:
-                google_news = self.parsers['google_news'].search_news(max_results=60)
-                all_news.extend(google_news)
-                sources_used.append('Google News')
-                self.logger.info(f"Google News: найдено {len(google_news)} новостей")
-            except Exception as e:
-                error_msg = f"Google News: {str(e)}"
-                errors.append(error_msg)
-                self.logger.error(error_msg)
-        
-        # Hacker News
-        if 'hackernews' in self.parsers:
-            try:
-                hackernews_news = self.parsers['hackernews'].search_stories(max_results=50)
-                all_news.extend(hackernews_news)
-                sources_used.append('Hacker News')
-                self.logger.info(f"Hacker News: найдено {len(hackernews_news)} новостей")
-            except Exception as e:
-                error_msg = f"Hacker News: {str(e)}"
-                errors.append(error_msg)
-                self.logger.error(error_msg)
-        
-        # Reddit
-        if 'reddit' in self.parsers:
-            try:
-                reddit_news = self.parsers['reddit'].search_posts(max_results=50)
-                all_news.extend(reddit_news)
-                sources_used.append('Reddit')
-                self.logger.info(f"Reddit: найдено {len(reddit_news)} новостей")
-            except Exception as e:
-                error_msg = f"Reddit: {str(e)}"
-                errors.append(error_msg)
-                self.logger.error(error_msg)
-        
-        self.logger.info(f"Всего собрано {len(all_news)} новостей из {len(sources_used)} источников")
-        
-        return all_news, sources_used, errors
-    
+    def _telegram(self) -> TelegramSender:
+        if self.telegram_sender is None:
+            self.telegram_sender = TelegramSender()
+        return self.telegram_sender
+
     def process_news(self, news_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Обрабатывает собранные новости"""
-        self.logger.info("Обрабатываем собранные новости...")
-        
-        # Удаляем дубликаты
+        self.logger.info("Обрабатываем собранные материалы...")
         unique_news = self.filter.remove_duplicates(news_list)
-        self.logger.info(f"После удаления дубликатов: {len(unique_news)} новостей")
-        
-        # Фильтруем по релевантности (практика/бизнес важнее анонсов)
+        self.logger.info("После дубликатов: %s", len(unique_news))
+
         relevant_news = self.filter.filter_news_by_relevance(unique_news, min_score=20)
-        self.logger.info(f"После фильтрации по релевантности: {len(relevant_news)} новостей")
-        
-        # Сортируем по итоговому рейтингу (релевантность + популярность),
-        # а при равенстве — по дате.
+        self.logger.info("После релевантности: %s", len(relevant_news))
+
         def _published_ts(item: Dict[str, Any]) -> float:
             published = item.get("published_date")
             if isinstance(published, datetime):
@@ -153,290 +62,260 @@ class AINewsAggregator:
             key=lambda x: (x.get("ranking_score", 0), _published_ts(x)),
             reverse=True,
         )
-
-        before_similar = len(relevant_news)
+        before = len(relevant_news)
         relevant_news = self.filter.drop_similar_titles(relevant_news)
-        if len(relevant_news) < before_similar:
-            self.logger.info(
-                "Убраны похожие заголовки: %s → %s",
-                before_similar,
-                len(relevant_news),
-            )
+        if len(relevant_news) < before:
+            self.logger.info("Похожие заголовки: %s → %s", before, len(relevant_news))
 
-        max_items = self.config.DIGEST_MAX_ITEMS
-        if len(relevant_news) > max_items:
-            self.logger.info("Оставляем топ-%s из %s по рейтингу", max_items, len(relevant_news))
-            relevant_news = relevant_news[:max_items]
-        
+        # DIGEST_MAX_ITEMS больше не обрезает материалы для модели
         return relevant_news
 
-    def process_business_reddit(self, posts: List[Dict[str, Any]], max_items: int = 50) -> List[Dict[str, Any]]:
-        """Посты Reddit: идеи бизнеса / истории запуска, язык, популярность."""
-        self.logger.info("Обрабатываем посты про бизнес-идеи...")
-        unique_posts = self.filter.remove_duplicates(posts)
-        self.logger.info(f"После удаления дубликатов: {len(unique_posts)} постов")
-        filtered = self.filter.filter_business_reddit_posts(unique_posts, max_items=max_items)
-        self.logger.info(f"После фильтра идей/языка и среза: {len(filtered)} постов")
-        return filtered
+    def process_manual_items(self, news_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Свои тексты: дубли и похожие заголовки как у прогона, без порога релевантности."""
+        self.logger.info("Обрабатываем свои тексты...")
+        unique_news = self.filter.remove_duplicates(news_list)
+        self.logger.info("После дубликатов: %s", len(unique_news))
 
-    def send_news_digest(
-        self,
-        news_list: List[Dict[str, Any]],
-        sources_used: List[str],
-        errors: List[str],
-        *,
-        feed_title: str = "AI News Digest",
-        item_emoji: str = "🧠",
-        summary_run_name: str = "AI News Aggregator",
-    ):
-        """Отправляет новости в Telegram: каждую статью отдельным сообщением."""
-        try:
-            if not news_list:
-                message = (
-                    f"📰 <b>{feed_title}</b>\n\n"
-                    f"Новостей не найдено за последние {self.config.NEWS_LOOKBACK_DAYS} дней."
-                )
-                self.telegram_sender.send_message(message, parse_mode="HTML")
-                return
+        kept = [
+            item
+            for item in unique_news
+            if self.filter.title_letters_are_ru_or_en(item.get("title", ""))
+        ]
+        self.logger.info("После языка заголовка: %s", len(kept))
 
-            sent_count = 0
+        before = len(kept)
+        kept = self.filter.drop_similar_titles(kept)
+        if len(kept) < before:
+            self.logger.info("Похожие заголовки: %s → %s", before, len(kept))
+        return kept
 
-            for news in news_list:
-                title = news.get("title", "Без заголовка")
-                url = news.get("url", "#")
-                source = news.get("source", "Неизвестный источник")
+    def collect_news(self) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Собирает новости. Возвращает (items, protocol_notes)."""
+        all_news: List[Dict[str, Any]] = []
+        protocol: List[str] = []
+        keywords = self.active_keywords
 
-                message = (
-                    f"{item_emoji} <b>{title}</b>\n\n"
-                    f"Источник: {source}\n"
-                    f"{url}"
-                )
+        def note_disabled(name: str) -> None:
+            msg = f"{name}: отключён в .env"
+            protocol.append(msg)
+            self.logger.warning(msg)
 
-                success = self.telegram_sender.send_message(message, parse_mode="HTML")
-
-                if success:
-                    sent_count += 1
-                else:
-                    self.logger.error(f"Не удалось отправить сообщение для новости: {title}")
-            
-            # Отправляем сводку
-            self.telegram_sender.send_summary(len(news_list), sources_used, errors, run_name=summary_run_name)
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка при отправке дайджеста: {e}")
-            self.telegram_sender.send_error_message(str(e))
-
-    def run_reddit_business(self):
-        """Только Reddit: популярные бизнес-идеи и истории запуска за ~7 дней."""
-        try:
-            self.logger.info("Запуск Reddit Business Ideas digest...")
-            self.config.validate_config()
-            if not self.config.ENABLE_REDDIT:
-                self.logger.error("Reddit отключён в конфиге (ENABLE_REDDIT=false)")
-                self.telegram_sender.send_message(
-                    "❌ <b>Reddit Business</b>\n\nВключите ENABLE_REDDIT в .env для этого режима.",
-                    parse_mode="HTML",
-                )
-                return
-            errors: List[str] = []
-            parser = RedditParser()
-            raw_posts = parser.search_business_posts(max_results=55)
-            if not raw_posts:
-                self.logger.warning("Бизнес-посты Reddit не найдены")
-                self.telegram_sender.send_message(
-                    "📰 <b>Reddit Business Digest</b>\n\n"
-                    f"Постов не найдено за последние {self.config.NEWS_LOOKBACK_DAYS} дней.",
-                    parse_mode="HTML",
-                )
-                return
-            processed = self.process_business_reddit(raw_posts, max_items=50)
-            sources_used = ["Reddit Business"]
-            if not processed:
-                self.telegram_sender.send_message(
-                    "📰 <b>Reddit Business Digest</b>\n\n"
-                    "После фильтров постов не осталось.",
-                    parse_mode="HTML",
-                )
-                return
-            self.send_news_digest(
-                processed,
-                sources_used,
-                errors,
-                feed_title="Reddit Business Digest",
-                item_emoji="💼",
-                summary_run_name="Reddit Business Digest",
-            )
-            self.logger.info("Reddit Business digest завершён успешно")
-        except Exception as e:
-            self.logger.error(f"Критическая ошибка Reddit Business: {e}")
-            self.telegram_sender.send_error_message(str(e))
-
-    def run_selected_sources(self, selected_sources: List[str], *, digest_title: str):
-        """Запускает дайджест только по выбранным источникам."""
-        try:
-            self.logger.info("Запуск выборочного дайджеста: %s", ", ".join(selected_sources))
-            self.config.validate_config()
-
-            source_configs = {
-                "twitter": {
-                    "enabled": self.config.ENABLE_TWITTER,
-                    "display": "Twitter",
-                    "fetcher": lambda: self.parsers["twitter"].search_tweets(max_results=60),
-                },
-                "google_news": {
-                    "enabled": self.config.ENABLE_GOOGLE_NEWS,
-                    "display": "Google News",
-                    "fetcher": lambda: self.parsers["google_news"].search_news(max_results=60),
-                },
-                "hackernews": {
-                    "enabled": self.config.ENABLE_HACKERNEWS,
-                    "display": "Hacker News",
-                    "fetcher": lambda: self.parsers["hackernews"].search_stories(max_results=50),
-                },
-                "reddit": {
-                    "enabled": self.config.ENABLE_REDDIT,
-                    "display": "Reddit",
-                    "fetcher": lambda: self.parsers["reddit"].search_posts(max_results=50),
-                },
-            }
-
-            all_news: List[Dict[str, Any]] = []
-            sources_used: List[str] = []
-            errors: List[str] = []
-
-            for source_key in selected_sources:
-                config = source_configs.get(source_key)
-                if config is None:
-                    continue
-
-                if not config["enabled"] or source_key not in self.parsers:
-                    errors.append(f"{config['display']}: отключен в .env")
-                    self.logger.warning("%s отключен в .env", config["display"])
-                    continue
-
-                try:
-                    source_news = config["fetcher"]()
-                    all_news.extend(source_news)
-                    sources_used.append(config["display"])
-                    self.logger.info("%s: найдено %s материалов", config["display"], len(source_news))
-                except Exception as e:
-                    error_msg = f"{config['display']}: {str(e)}"
-                    errors.append(error_msg)
-                    self.logger.error(error_msg)
-
-            if not all_news:
-                self.telegram_sender.send_message(
-                    f"📰 *{digest_title}*\n\nНовостей не найдено за последние {self.config.NEWS_LOOKBACK_DAYS} дней."
-                )
-                return
-
-            processed_news = self.process_news(all_news)
-            self.send_news_digest(
-                processed_news,
-                sources_used,
-                errors,
-                feed_title=digest_title,
-                summary_run_name=digest_title,
-            )
-        except Exception as e:
-            self.logger.error("Критическая ошибка выборочного запуска: %s", e)
-            self.telegram_sender.send_error_message(str(e))
-    
-    def run(self):
-        """Основной метод запуска агрегатора"""
-        try:
-            self.logger.info("Запуск AI News Aggregator...")
-            
-            # Проверяем конфигурацию
-            self.config.validate_config()
-            
-            # Собираем новости
-            all_news, sources_used, errors = self.collect_news()
-            
-            if not all_news:
-                self.logger.warning("Новости не найдены")
-                self.telegram_sender.send_message(
-                    f"📰 *AI News Digest*\n\nНовостей не найдено за последние {self.config.NEWS_LOOKBACK_DAYS} дней."
-                )
-                return
-            
-            # Обрабатываем новости
-            processed_news = self.process_news(all_news)
-            
-            # Отправляем дайджест
-            self.send_news_digest(processed_news, sources_used, errors)
-            
-            self.logger.info("AI News Aggregator завершил работу успешно")
-            
-        except Exception as e:
-            self.logger.error(f"Критическая ошибка в AI News Aggregator: {e}")
-            self.telegram_sender.send_error_message(str(e))
-    
-    def test_sources(self):
-        """Тестирует доступность источников"""
-        self.logger.info("Тестирование источников...")
-        
-        for source_name, parser in self.parsers.items():
+        # Google News
+        if self.config.ENABLE_GOOGLE_NEWS:
             try:
-                if source_name == 'twitter':
-                    test_news = parser.search_tweets(max_results=1)
-                elif source_name == 'google_news':
-                    test_news = parser.search_news(max_results=1)
-                elif source_name == 'hackernews':
-                    test_news = parser.search_stories(max_results=1)
-                elif source_name == 'reddit':
-                    test_news = parser.search_posts(max_results=1)
-                
-                self.logger.info(f"✅ {source_name}: OK")
-                
+                from sources.google_news_parser import GoogleNewsParser
+
+                parser = GoogleNewsParser(keywords)
+                items = parser.search_news(max_results=self.config.GOOGLE_NEWS_MAX)
+                all_news.extend(items)
+                self.logger.info("Google News: %s", len(items))
             except Exception as e:
-                self.logger.error(f"❌ {source_name}: {e}")
+                msg = f"Google News: {e}"
+                protocol.append(msg)
+                self.logger.error(msg)
+        else:
+            note_disabled("Google News")
+
+        # Hacker News
+        if self.config.ENABLE_HACKERNEWS:
+            try:
+                from sources.hackernews_parser import HackerNewsParser
+
+                parser = HackerNewsParser(keywords)
+                items = parser.search_stories(max_results=self.config.HACKERNEWS_MAX)
+                all_news.extend(items)
+                self.logger.info("Hacker News: %s", len(items))
+            except Exception as e:
+                msg = f"Hacker News: {e}"
+                protocol.append(msg)
+                self.logger.error(msg)
+        else:
+            note_disabled("Hacker News")
+
+        # Reddit AI + business
+        if self.config.ENABLE_REDDIT:
+            try:
+                from sources.reddit_parser import RedditParser
+
+                parser = RedditParser(keywords)
+                ai_posts = parser.search_posts(max_results=self.config.REDDIT_AI_MAX)
+                biz_posts = parser.search_business_posts(max_results=self.config.REDDIT_BUSINESS_MAX)
+                all_news.extend(ai_posts)
+                all_news.extend(biz_posts)
+                self.logger.info("Reddit AI: %s, business: %s", len(ai_posts), len(biz_posts))
+            except Exception as e:
+                msg = f"Reddit: {e}"
+                protocol.append(msg)
+                self.logger.error(msg)
+        else:
+            note_disabled("Reddit")
+
+        self.logger.info("Всего сырых материалов: %s", len(all_news))
+        return all_news, protocol
+
+    def complete_run(self, processed: List[Dict[str, Any]], protocol_text: str = "") -> int:
+        """DeepSeek, запись в SQLite и одно уведомление в Telegram.
+
+        Вызывается и обычным прогоном, и разбором своих текстов.
+        Если ошибка после создания прогона — статус failed, исключение пробрасывается.
+        В Telegram ошибку не отправляем.
+        """
+        run_id: Optional[int] = None
+        try:
+            run_id = self.db.create_run(self.config.NEWS_LOOKBACK_DAYS)
+            self.db.save_items(run_id, processed)
+
+            client = DeepSeekClient()
+            summary = client.build_weekly_analysis(processed)
+            articles, proposed = client.build_articles_and_keywords(processed, summary)
+
+            self.db.save_summary(run_id, summary)
+            self.db.save_articles(run_id, articles)
+            added = self.db.propose_keywords(proposed, run_id)
+            self.logger.info("Статей: %s, новых proposed-ключей: %s", len(articles), added)
+
+            self.db.finish_run(run_id, status="ok", error_text=protocol_text)
+            self._send_success_notification(run_id)
+            self.logger.info("Прогон завершён успешно")
+            return run_id
+        except Exception as e:
+            if run_id is not None:
+                self.db.finish_run(run_id, status="failed", error_text=str(e))
+            raise
+
+    def run(self) -> None:
+        try:
+            self.logger.info("Запуск полного недельного прогона...")
+            self.config.validate_config()
+
+            all_news, protocol = self.collect_news()
+            processed = self.process_news(all_news) if all_news else []
+            protocol_text = "\n".join(protocol)
+
+            if protocol:
+                self.logger.info("Протокол источников:\n%s", protocol_text)
+
+            if not processed:
+                self.logger.info(
+                    "Пустой прогон: после фильтров нет материалов "
+                    "(lookback=%s дн.). В SQLite и Telegram ничего не пишем.",
+                    self.config.NEWS_LOOKBACK_DAYS,
+                )
+                return
+
+            self.complete_run(processed, protocol_text)
+
+        except Exception as e:
+            self.logger.error("Критическая ошибка прогона: %s", e)
+            # В Telegram ошибку не отправляем. Статус failed ставит complete_run.
+
+    def run_manual(self, items: List[Dict[str, Any]]) -> int:
+        """Разбор уже отобранных текстов без сбора источников. Возвращает run_id."""
+        self.logger.info("Запуск разбора своих текстов...")
+        self.config.validate_config()
+        processed = self.process_manual_items(items)
+        if not processed:
+            self.logger.info(
+                "Пустой ручной прогон: после фильтров нет материалов. "
+                "В SQLite и Telegram ничего не пишем."
+            )
+            raise ValueError(MANUAL_TITLE_LANGUAGE_ERROR)
+        return self.complete_run(processed, "")
+
+    def _send_success_notification(self, run_id: int) -> None:
+        message = build_run_ready_notification(self.config.WEB_URL)
+        ok = self._telegram().send_message(message, parse_mode=None)
+        if ok:
+            self.db.mark_telegram_sent(run_id)
+        else:
+            self.logger.error("Не удалось отправить уведомление в Telegram")
+
+    def test_sources(self) -> None:
+        """Проверка источников без Telegram и без записи разбора."""
+        self.logger.info("Тестирование источников (без Telegram / без записи разбора)...")
+        keywords = self.active_keywords
+
+        if self.config.ENABLE_GOOGLE_NEWS:
+            try:
+                from sources.google_news_parser import GoogleNewsParser
+
+                n = len(GoogleNewsParser(keywords).search_news(max_results=1))
+                self.logger.info("Google News: OK (%s)", n)
+            except Exception as e:
+                self.logger.error("Google News: %s", e)
+
+        if self.config.ENABLE_HACKERNEWS:
+            try:
+                from sources.hackernews_parser import HackerNewsParser
+
+                n = len(HackerNewsParser(keywords).search_stories(max_results=1))
+                self.logger.info("Hacker News: OK (%s)", n)
+            except Exception as e:
+                self.logger.error("Hacker News: %s", e)
+
+        if self.config.ENABLE_REDDIT:
+            try:
+                from sources.reddit_parser import RedditParser
+
+                n = len(RedditParser(keywords).search_posts(max_results=1))
+                self.logger.info("Reddit: OK (%s)", n)
+            except Exception as e:
+                self.logger.error("Reddit: %s", e)
+
+
+def normalize_manual_pairs(pairs: List[Any]) -> List[Dict[str, Any]]:
+    """Полные пары заголовок+текст становятся материалами с description."""
+    now = datetime.now(timezone.utc)
+    items: List[Dict[str, Any]] = []
+    for raw in pairs:
+        if not isinstance(raw, dict):
+            continue
+        title = raw.get("title")
+        text = raw.get("text")
+        if not isinstance(title, str) or not isinstance(text, str):
+            continue
+        title = title.strip()
+        text = text.strip()
+        if not title or not text:
+            continue
+        items.append(
+            {
+                "title": title,
+                "description": text,
+                "source": MANUAL_SOURCE,
+                "url": "",
+                "published_date": now,
+            }
+        )
+    return items
+
 
 def main():
-    """Точка входа в программу"""
-    # Настраиваем логирование
     logger = setup_logging()
-    
     try:
         cli_arg = sys.argv[1] if len(sys.argv) > 1 else None
 
-        # Какие парсеры поднимать: None = все включённые в .env
-        sources_by_mode = {
-            "--reddit-only": ["reddit"],
-            "--google-hn": ["google_news", "hackernews"],
-            # Reddit Business создаёт свой RedditParser внутри метода
-            "--reddit-business": [],
-        }
-        enabled_sources = sources_by_mode.get(cli_arg) if cli_arg else None
-
-        aggregator = AINewsAggregator(enabled_sources=enabled_sources)
-
         if cli_arg == "--test":
+            aggregator = AINewsAggregator()
             aggregator.test_sources()
             return
 
-        if cli_arg == "--reddit-business":
-            aggregator.run_reddit_business()
-            return
-
-        if cli_arg == "--reddit-only":
-            aggregator.run_selected_sources(["reddit"], digest_title="Reddit AI Digest")
-            return
-
-        if cli_arg == "--google-hn":
-            aggregator.run_selected_sources(
-                ["google_news", "hackernews"],
-                digest_title="Google + Hacker News AI Digest",
+        if cli_arg is not None:
+            logger.error(
+                "Неизвестный аргумент %s. Допустимо: python main.py или python main.py --test",
+                cli_arg,
             )
-            return
+            sys.exit(2)
 
+        aggregator = AINewsAggregator()
         aggregator.run()
-        
+
     except KeyboardInterrupt:
         logger.info("Программа прервана пользователем")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        logger.error("Критическая ошибка: %s", e)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

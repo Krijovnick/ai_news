@@ -1,0 +1,371 @@
+"""SQLite-хранилище прогонов, материалов, разборов, статей и ключевых слов."""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from utils.config import Config, SEED_KEYWORDS
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+class NewsDatabase:
+    def __init__(self, path: Optional[str] = None):
+        self.path = path or Config.DB_PATH
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        self.ensure_schema()
+        self.seed_keywords_if_empty()
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def ensure_schema(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                lookback_days INTEGER NOT NULL,
+                error_text TEXT,
+                telegram_sent INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                source TEXT,
+                title TEXT,
+                url TEXT,
+                text TEXT,
+                published_at TEXT,
+                score REAL,
+                extra_json TEXT,
+                FOREIGN KEY(run_id) REFERENCES runs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL UNIQUE,
+                body TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES runs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                rationale TEXT,
+                FOREIGN KEY(run_id) REFERENCES runs(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phrase TEXT NOT NULL,
+                status TEXT NOT NULL,
+                run_id INTEGER,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES runs(id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_keywords_phrase_ci
+                ON keywords(phrase COLLATE NOCASE);
+            """
+        )
+        self._conn.commit()
+
+    def seed_keywords_if_empty(self) -> None:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM keywords WHERE status = 'active'"
+        ).fetchone()
+        if row and row["c"] > 0:
+            return
+        now = _utc_now_iso()
+        for phrase in SEED_KEYWORDS:
+            try:
+                self._conn.execute(
+                    "INSERT INTO keywords (phrase, status, run_id, updated_at) VALUES (?, 'active', NULL, ?)",
+                    (phrase, now),
+                )
+            except sqlite3.IntegrityError:
+                continue
+        self._conn.commit()
+
+    # --- keywords ---
+
+    def get_keywords(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
+        if status:
+            rows = self._conn.execute(
+                "SELECT * FROM keywords WHERE status = ? ORDER BY phrase COLLATE NOCASE",
+                (status,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM keywords ORDER BY status, phrase COLLATE NOCASE"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_keywords(self) -> List[str]:
+        return [r["phrase"] for r in self.get_keywords("active")]
+
+    def known_phrases_lower(self, statuses: Sequence[str]) -> Set[str]:
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self._conn.execute(
+            f"SELECT phrase FROM keywords WHERE status IN ({placeholders})",
+            tuple(statuses),
+        ).fetchall()
+        return {r["phrase"].lower() for r in rows}
+
+    def add_keyword(self, phrase: str, status: str = "active", run_id: Optional[int] = None) -> Optional[int]:
+        phrase = (phrase or "").strip()
+        if not phrase:
+            return None
+        now = _utc_now_iso()
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO keywords (phrase, status, run_id, updated_at) VALUES (?, ?, ?, ?)",
+                (phrase, status, run_id, now),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+    def update_keyword_phrase(self, keyword_id: int, phrase: str) -> bool:
+        phrase = (phrase or "").strip()
+        if not phrase:
+            return False
+        try:
+            self._conn.execute(
+                "UPDATE keywords SET phrase = ?, updated_at = ? WHERE id = ?",
+                (phrase, _utc_now_iso(), keyword_id),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def set_keyword_status(self, keyword_id: int, status: str) -> None:
+        self._conn.execute(
+            "UPDATE keywords SET status = ?, updated_at = ? WHERE id = ?",
+            (status, _utc_now_iso(), keyword_id),
+        )
+        self._conn.commit()
+
+    def delete_keyword(self, keyword_id: int) -> None:
+        self._conn.execute("DELETE FROM keywords WHERE id = ?", (keyword_id,))
+        self._conn.commit()
+
+    def propose_keywords(self, phrases: Sequence[str], run_id: int) -> int:
+        """Сохраняет новые формулировки как proposed; active и rejected пропускает."""
+        blocked = self.known_phrases_lower(("active", "rejected", "proposed"))
+        added = 0
+        now = _utc_now_iso()
+        for raw in phrases:
+            phrase = (raw or "").strip()
+            if not phrase or phrase.lower() in blocked:
+                continue
+            try:
+                self._conn.execute(
+                    "INSERT INTO keywords (phrase, status, run_id, updated_at) VALUES (?, 'proposed', ?, ?)",
+                    (phrase, run_id, now),
+                )
+                blocked.add(phrase.lower())
+                added += 1
+            except sqlite3.IntegrityError:
+                continue
+        self._conn.commit()
+        return added
+
+    # --- runs / content ---
+
+    def create_run(self, lookback_days: int) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO runs (started_at, status, lookback_days, error_text, telegram_sent) "
+            "VALUES (?, 'running', ?, '', 0)",
+            (_utc_now_iso(), lookback_days),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def delete_runs_without_items(self) -> List[int]:
+        """Удаляет прогоны без единой строки в items. Связанные summaries/articles тоже."""
+        rows = self._conn.execute(
+            """
+            SELECT r.id FROM runs r
+            WHERE NOT EXISTS (SELECT 1 FROM items i WHERE i.run_id = r.id)
+            """
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        for run_id in ids:
+            self._conn.execute("DELETE FROM articles WHERE run_id = ?", (run_id,))
+            self._conn.execute("DELETE FROM summaries WHERE run_id = ?", (run_id,))
+            # keywords.run_id только ссылка; фразы не трогаем, обнуляем привязку
+            self._conn.execute(
+                "UPDATE keywords SET run_id = NULL WHERE run_id = ?", (run_id,)
+            )
+            self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        if ids:
+            self._conn.commit()
+        return ids
+
+    def finish_run(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        error_text: str = "",
+        telegram_sent: Optional[bool] = None,
+    ) -> None:
+        fields = ["finished_at = ?", "status = ?", "error_text = ?"]
+        values: List[Any] = [_utc_now_iso(), status, error_text or ""]
+        if telegram_sent is not None:
+            fields.append("telegram_sent = ?")
+            values.append(1 if telegram_sent else 0)
+        values.append(run_id)
+        self._conn.execute(
+            f"UPDATE runs SET {', '.join(fields)} WHERE id = ?",
+            values,
+        )
+        self._conn.commit()
+
+    def mark_telegram_sent(self, run_id: int) -> None:
+        self._conn.execute(
+            "UPDATE runs SET telegram_sent = 1 WHERE id = ?",
+            (run_id,),
+        )
+        self._conn.commit()
+
+    def save_items(self, run_id: int, items: Sequence[Dict[str, Any]]) -> None:
+        for item in items:
+            published = item.get("published_date") or item.get("published_at")
+            if isinstance(published, datetime):
+                published_at = published.isoformat()
+            else:
+                published_at = str(published) if published else None
+            extra = {
+                k: v
+                for k, v in item.items()
+                if k
+                not in {
+                    "title",
+                    "url",
+                    "description",
+                    "text",
+                    "source",
+                    "published_date",
+                    "published_at",
+                    "score",
+                    "relevance_score",
+                    "ranking_score",
+                }
+            }
+            # JSON-safe: datetime etc.
+            def _default(o):
+                if isinstance(o, datetime):
+                    return o.isoformat()
+                return str(o)
+
+            self._conn.execute(
+                "INSERT INTO items (run_id, source, title, url, text, published_at, score, extra_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    item.get("source"),
+                    item.get("title"),
+                    item.get("url"),
+                    item.get("description") or item.get("text") or "",
+                    published_at,
+                    item.get("ranking_score", item.get("score")),
+                    json.dumps(extra, ensure_ascii=False, default=_default),
+                ),
+            )
+        self._conn.commit()
+
+    def save_summary(self, run_id: int, body: str) -> None:
+        self._conn.execute(
+            "INSERT INTO summaries (run_id, body) VALUES (?, ?) "
+            "ON CONFLICT(run_id) DO UPDATE SET body = excluded.body",
+            (run_id, body),
+        )
+        self._conn.commit()
+
+    def save_articles(self, run_id: int, articles: Sequence[Dict[str, str]]) -> None:
+        for art in articles:
+            self._conn.execute(
+                "INSERT INTO articles (run_id, title, body, rationale) VALUES (?, ?, ?, ?)",
+                (
+                    run_id,
+                    art.get("title") or "Без заголовка",
+                    art.get("body") or "",
+                    art.get("rationale") or "",
+                ),
+            )
+        self._conn.commit()
+
+    def get_run(self, run_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_summary(self, run_id: int) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT body FROM summaries WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return row["body"] if row else None
+
+    def get_articles_for_run(self, run_id: int) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM articles WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_article(self, article_id: int) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM articles WHERE id = ?", (article_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_runs(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM runs ORDER BY started_at DESC, id DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def group_runs_by_iso_week(runs: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Группирует прогоны по календарной ISO-неделе; новые недели сверху."""
+    buckets: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    for run in runs:
+        started = run.get("started_at") or ""
+        try:
+            dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        except ValueError:
+            dt = datetime.now(timezone.utc)
+        iso = dt.isocalendar()
+        key = (iso.year, iso.week)
+        if key not in buckets:
+            buckets[key] = {
+                "year": iso.year,
+                "week": iso.week,
+                "label": f"{iso.year}-W{iso.week:02d}",
+                "runs": [],
+            }
+        buckets[key]["runs"].append(run)
+
+    weeks = list(buckets.values())
+    weeks.sort(key=lambda w: (w["year"], w["week"]), reverse=True)
+    for week in weeks:
+        week["runs"].sort(key=lambda r: (r.get("started_at") or "", r.get("id") or 0), reverse=True)
+    return weeks
