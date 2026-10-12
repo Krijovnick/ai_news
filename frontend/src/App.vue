@@ -20,6 +20,10 @@
         Текст
         <textarea v-model="pair.text" rows="5" :disabled="busy"></textarea>
       </label>
+      <label>
+        Ссылка
+        <input v-model="pair.url" type="url" placeholder="https://" :disabled="busy">
+      </label>
       <button
         v-if="pairs.length > 1"
         type="button"
@@ -53,7 +57,7 @@ const router = useRouter()
 let nextId = 1
 
 function blankPair() {
-  return { id: nextId++, title: "", text: "" }
+  return { id: nextId++, title: "", text: "", url: "" }
 }
 
 const panelOpen = ref(false)
@@ -84,7 +88,11 @@ function removePair(index) {
 async function submitPairs() {
   if (busy.value || !canSubmit.value) return
   const items = pairs.value
-    .map((pair) => ({ title: pair.title.trim(), text: pair.text.trim() }))
+    .map((pair) => ({
+      title: pair.title.trim(),
+      text: pair.text.trim(),
+      url: (pair.url || "").trim(),
+    }))
     .filter((pair) => pair.title && pair.text)
   busy.value = true
   errorText.value = ""

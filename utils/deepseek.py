@@ -143,17 +143,22 @@ class DeepSeekClient:
         *,
         articles_per_run: Optional[int] = None,
         author_prompt: Optional[str] = None,
-    ) -> Tuple[List[Dict[str, str]], List[str]]:
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
         n = articles_per_run if articles_per_run is not None else Config.ARTICLES_PER_RUN
         author = author_prompt if author_prompt is not None else load_author_prompt()
         materials = format_items_for_prompt(items)
+        allowed_urls = _item_urls(items)
 
         user_prompt = (
             f"{author}\n\n"
             f"Лимит статей: до {n}. Если полезных тем меньше — меньше; ноль допустим.\n"
             "Верни строго JSON-объект:\n"
-            '{"articles":[{"title":"...","body":"...","rationale":"..."}],'
+            '{"articles":[{"title":"...","body":"...","rationale":"...",'
+            '"source_urls":["https://..."]}],'
             '"keywords":["фраза1","фраза2"]}\n'
+            "У каждой статьи source_urls — список URL из поля URL материалов выше, "
+            "на которых основан текст статьи. Бери только URL из материалов; "
+            "если опиралась на материал без URL — оставь source_urls пустым массивом.\n"
             "keywords — новые технологии и формулировки из материалов, которых ещё нет "
             "в известных списках; короткие фразы для поиска.\n\n"
             f"Разбор недели:\n{summary}\n\nМатериалы:\n{materials}"
@@ -172,10 +177,47 @@ class DeepSeekClient:
             ],
             temperature=0.8,
         )
-        return _parse_articles_payload(raw, max_articles=n)
+        return _parse_articles_payload(raw, max_articles=n, allowed_urls=allowed_urls)
 
 
-def _parse_articles_payload(raw: str, max_articles: int) -> Tuple[List[Dict[str, str]], List[str]]:
+def _item_urls(items: Sequence[Dict[str, Any]]) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for item in items:
+        url = str(item.get("url") or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _normalize_article_source_urls(
+    raw: Any,
+    allowed_urls: Optional[Sequence[str]] = None,
+) -> List[str]:
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    allowed_set = (
+        {u for u in allowed_urls if u} if allowed_urls is not None else None
+    )
+    result: List[str] = []
+    for item in raw:
+        url = str(item or "").strip()
+        if not url or url in result:
+            continue
+        if allowed_set is not None and url not in allowed_set:
+            continue
+        result.append(url)
+    return result
+
+
+def _parse_articles_payload(
+    raw: str,
+    max_articles: int,
+    allowed_urls: Optional[Sequence[str]] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     text = raw.strip()
     fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if fence:
@@ -194,7 +236,7 @@ def _parse_articles_payload(raw: str, max_articles: int) -> Tuple[List[Dict[str,
 
     articles_raw = data.get("articles") or []
     keywords_raw = data.get("keywords") or []
-    articles: List[Dict[str, str]] = []
+    articles: List[Dict[str, Any]] = []
     for art in articles_raw[:max_articles]:
         if not isinstance(art, dict):
             continue
@@ -207,6 +249,10 @@ def _parse_articles_payload(raw: str, max_articles: int) -> Tuple[List[Dict[str,
                 "title": title,
                 "body": body,
                 "rationale": str(art.get("rationale") or "").strip(),
+                "source_urls": _normalize_article_source_urls(
+                    art.get("source_urls"),
+                    allowed_urls=allowed_urls,
+                ),
             }
         )
     keywords = []

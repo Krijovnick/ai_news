@@ -263,6 +263,15 @@ class AINewsAggregator:
                 self.logger.error("Reddit: %s", e)
 
 
+def _manual_item_url(raw: Dict[str, Any]) -> str:
+    """Опциональный URL пары: поле url или link; пустая строка допустима."""
+    for key in ("url", "link"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
 def normalize_manual_pairs(pairs: List[Any]) -> List[Dict[str, Any]]:
     """Полные пары заголовок+текст становятся материалами с description."""
     now = datetime.now(timezone.utc)
@@ -283,7 +292,7 @@ def normalize_manual_pairs(pairs: List[Any]) -> List[Dict[str, Any]]:
                 "title": title,
                 "description": text,
                 "source": MANUAL_SOURCE,
-                "url": "",
+                "url": _manual_item_url(raw),
                 "published_date": now,
             }
         )

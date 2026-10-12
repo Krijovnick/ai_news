@@ -15,6 +15,42 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def _serialize_source_urls(value: Any) -> str:
+    urls: List[str] = []
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = [value] if value.strip() else []
+        value = parsed
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            url = str(item or "").strip()
+            if url and url not in urls:
+                urls.append(url)
+    return json.dumps(urls, ensure_ascii=False)
+
+
+def _parse_source_urls(raw: Any) -> List[str]:
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return [str(u).strip() for u in raw if str(u or "").strip()]
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(u).strip() for u in data if str(u or "").strip()]
+
+
+def _article_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    data = dict(row)
+    data["source_urls"] = _parse_source_urls(data.get("source_urls"))
+    return data
+
+
 class NewsDatabase:
     def __init__(self, path: Optional[str] = None):
         self.path = path or Config.DB_PATH
@@ -68,6 +104,7 @@ class NewsDatabase:
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
                 rationale TEXT,
+                source_urls TEXT,
                 FOREIGN KEY(run_id) REFERENCES runs(id)
             );
 
@@ -84,7 +121,16 @@ class NewsDatabase:
                 ON keywords(phrase COLLATE NOCASE);
             """
         )
+        self._ensure_articles_source_urls_column()
         self._conn.commit()
+
+    def _ensure_articles_source_urls_column(self) -> None:
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(articles)").fetchall()
+        }
+        if "source_urls" not in cols:
+            self._conn.execute("ALTER TABLE articles ADD COLUMN source_urls TEXT")
 
     def seed_keywords_if_empty(self) -> None:
         row = self._conn.execute(
@@ -302,15 +348,17 @@ class NewsDatabase:
         )
         self._conn.commit()
 
-    def save_articles(self, run_id: int, articles: Sequence[Dict[str, str]]) -> None:
+    def save_articles(self, run_id: int, articles: Sequence[Dict[str, Any]]) -> None:
         for art in articles:
             self._conn.execute(
-                "INSERT INTO articles (run_id, title, body, rationale) VALUES (?, ?, ?, ?)",
+                "INSERT INTO articles (run_id, title, body, rationale, source_urls) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
                     run_id,
                     art.get("title") or "Без заголовка",
                     art.get("body") or "",
                     art.get("rationale") or "",
+                    _serialize_source_urls(art.get("source_urls")),
                 ),
             )
         self._conn.commit()
@@ -329,13 +377,13 @@ class NewsDatabase:
         rows = self._conn.execute(
             "SELECT * FROM articles WHERE run_id = ? ORDER BY id", (run_id,)
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_article_row_to_dict(r) for r in rows]
 
     def get_article(self, article_id: int) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM articles WHERE id = ?", (article_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return _article_row_to_dict(row) if row else None
 
     def list_runs(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(

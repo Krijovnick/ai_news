@@ -216,7 +216,14 @@ class EmptyRunSkipTests(unittest.TestCase):
         fake_client = MagicMock()
         fake_client.build_weekly_analysis.return_value = "Разбор недели"
         fake_client.build_articles_and_keywords.return_value = (
-            [{"title": "Статья", "body": "Текст", "rationale": "почему"}],
+            [
+                {
+                    "title": "Статья",
+                    "body": "Текст",
+                    "rationale": "почему",
+                    "source_urls": ["https://example.com/case"],
+                }
+            ],
             ["new phrase"],
         )
 
@@ -229,7 +236,94 @@ class EmptyRunSkipTests(unittest.TestCase):
         self.assertEqual(self.db.get_summary(runs[0]["id"]), "Разбор недели")
         articles = self.db.get_articles_for_run(runs[0]["id"])
         self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["source_urls"], ["https://example.com/case"])
         agg._send_success_notification.assert_called_once_with(runs[0]["id"])
+
+
+class ArticleSourceUrlsTests(unittest.TestCase):
+    """source_urls у статей: БД, парсинг DeepSeek, API."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "test.db")
+        self.db = NewsDatabase(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        self._tmp.cleanup()
+
+    def test_save_and_get_article_source_urls(self):
+        run_id = self.db.create_run(7)
+        self.db.save_articles(
+            run_id,
+            [
+                {
+                    "title": "Тема",
+                    "body": "Текст статьи",
+                    "rationale": "зачем",
+                    "source_urls": [
+                        "https://example.com/a",
+                        "https://example.com/b",
+                    ],
+                }
+            ],
+        )
+        articles = self.db.get_articles_for_run(run_id)
+        self.assertEqual(
+            articles[0]["source_urls"],
+            ["https://example.com/a", "https://example.com/b"],
+        )
+        one = self.db.get_article(articles[0]["id"])
+        self.assertEqual(one["source_urls"], articles[0]["source_urls"])
+
+    def test_parse_keeps_only_allowed_item_urls(self):
+        from utils.deepseek import _parse_articles_payload
+
+        raw = (
+            '{"articles":[{"title":"Т","body":"Б","rationale":"",'
+            '"source_urls":["https://ok.example/x","https://fake.example/y"]}],'
+            '"keywords":[]}'
+        )
+        articles, _ = _parse_articles_payload(
+            raw,
+            max_articles=5,
+            allowed_urls=["https://ok.example/x"],
+        )
+        self.assertEqual(articles[0]["source_urls"], ["https://ok.example/x"])
+
+    def test_api_article_returns_source_urls(self):
+        import web as web_mod
+
+        run_id = self.db.create_run(7)
+        self.db.save_articles(
+            run_id,
+            [
+                {
+                    "title": "API статья",
+                    "body": "Тело",
+                    "rationale": "",
+                    "source_urls": ["https://example.com/src"],
+                }
+            ],
+        )
+        article_id = self.db.get_articles_for_run(run_id)[0]["id"]
+        orig = web_mod.get_db
+        web_mod.get_db = lambda: self.db
+        try:
+            client = web_mod.app.test_client()
+            resp = client.get(f"/api/articles/{article_id}")
+            run_resp = client.get(f"/api/runs/{run_id}")
+        finally:
+            web_mod.get_db = orig
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.get_json()["article"]["source_urls"],
+            ["https://example.com/src"],
+        )
+        self.assertEqual(
+            run_resp.get_json()["articles"][0]["source_urls"],
+            ["https://example.com/src"],
+        )
 
 
 class SslTrustTests(unittest.TestCase):
@@ -518,6 +612,57 @@ class ManualRunTests(unittest.TestCase):
         self.assertEqual(tg.return_value.send_message.call_count, 1)
         self.validate_mock.assert_called()
 
+    def test_manual_item_url_saved_from_url_or_link(self):
+        fake = self._fake_deepseek()
+        with patch("main.DeepSeekClient", return_value=fake), patch(
+            "main.TelegramSender"
+        ) as tg:
+            tg.return_value.send_message.return_value = True
+            resp = self.client.post(
+                "/api/manual-run",
+                json={
+                    "items": [
+                        {
+                            "title": "Опыт с агентами в сервисе",
+                            "text": "Текст с источником",
+                            "url": "https://example.com/manual-a",
+                        },
+                        {
+                            "title": "Домашний сад осенью",
+                            "text": "Другой текст про яблоки",
+                            "link": "https://example.com/manual-b",
+                        },
+                        {
+                            "title": "Прогулка по району",
+                            "text": "Только текст без адреса",
+                        },
+                    ]
+                },
+            )
+        self.assertEqual(resp.status_code, 200)
+        run_id = resp.get_json()["run_id"]
+        rows = self.db._conn.execute(
+            "SELECT title, url FROM items WHERE run_id = ? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+        by_title = {row["title"]: row["url"] or "" for row in rows}
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            by_title["Опыт с агентами в сервисе"], "https://example.com/manual-a"
+        )
+        self.assertEqual(by_title["Домашний сад осенью"], "https://example.com/manual-b")
+        self.assertEqual(by_title["Прогулка по району"], "")
+        passed = fake.build_weekly_analysis.call_args[0][0]
+        passed_urls = {item.get("url") or "" for item in passed}
+        self.assertEqual(
+            passed_urls,
+            {
+                "https://example.com/manual-a",
+                "https://example.com/manual-b",
+                "",
+            },
+        )
+
     def test_title_with_quotes_and_dash_is_not_dropped(self):
         title = "«Неделя» — заметка о жизни"
         text = "Короткий рассказ о домашних делах"
@@ -659,7 +804,23 @@ class ManualRunTests(unittest.TestCase):
         self.assertIn("Идёт разбор…", src)
         self.assertIn("is-busy", src)
         self.assertIn("/api/manual-run", src)
+        self.assertIn("Ссылка", src)
+        self.assertIn("pair.url", src)
         self.assertNotIn("v-html", src)
+
+    def test_article_view_shows_source_urls_block(self):
+        src_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "frontend",
+            "src",
+            "views",
+            "ArticleView.vue",
+        )
+        with open(src_path, encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("Использованные ссылки", src)
+        self.assertIn("source_urls", src)
+        self.assertIn("sourceUrls", src)
 
 
 def main():

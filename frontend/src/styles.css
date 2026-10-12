@@ -151,6 +151,16 @@ header .header-menu {
   margin-bottom: 0.65rem;
   font-weight: 600;
 }
+.manual-pair input[type=text],
+.manual-pair input[type=url] {
+  width: 100%;
+  padding: 0.4rem 0.5rem;
+  font: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+}
 .manual-pair textarea {
   width: 100%;
   min-height: 6.5rem;
@@ -160,6 +170,16 @@ header .header-menu {
   border-radius: 6px;
   background: #fff;
   color: var(--ink);
+}
+.article-sources {
+  margin-top: 1.5rem;
+}
+.article-sources ul {
+  padding-left: 1.25rem;
+  word-break: break-all;
+}
+.article-sources a {
+  color: var(--accent);
 }
 .manual-actions {
   display: flex;

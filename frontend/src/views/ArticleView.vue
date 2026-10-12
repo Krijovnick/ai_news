@@ -5,16 +5,30 @@
     <h1>{{ article.title }}</h1>
     <p v-if="article.rationale" class="muted">Почему эта тема: {{ article.rationale }}</p>
     <div class="article-body">{{ article.body }}</div>
+    <section v-if="sourceUrls.length" class="article-sources" aria-label="Использованные ссылки">
+      <h2>Использованные ссылки</h2>
+      <ul>
+        <li v-for="(url, index) in sourceUrls" :key="index">
+          <a :href="url" target="_blank" rel="noopener noreferrer">{{ url }}</a>
+        </li>
+      </ul>
+    </section>
   </template>
 </template>
 
 <script setup>
-import { ref, watch } from "vue"
+import { computed, ref, watch } from "vue"
 import { useRoute } from "vue-router"
 
 const route = useRoute()
 const article = ref(null)
 const notFound = ref(false)
+
+const sourceUrls = computed(() => {
+  const raw = article.value && article.value.source_urls
+  if (!Array.isArray(raw)) return []
+  return raw.map((u) => String(u || "").trim()).filter(Boolean)
+})
 
 async function load() {
   article.value = null
