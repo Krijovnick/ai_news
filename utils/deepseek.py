@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
+import yaml
 
 from utils.config import Config
 
@@ -16,19 +17,115 @@ logger = logging.getLogger(__name__)
 API_URL = "https://api.deepseek.com/v1/chat/completions"
 CHUNK_SIZE = 25
 
+# Обязательные секции/ключи PROMPTS_PATH — без текстов инструкций (источник текстов — YAML).
+_REQUIRED_PROMPT_KEYS: Dict[str, Tuple[str, ...]] = {
+    "weekly_analysis": (
+        "system_single",
+        "system_partial",
+        "system_merge",
+        "user_single",
+        "user_partial",
+        "user_merge",
+        "partials_joiner",
+    ),
+    "articles_and_keywords": (
+        "system",
+        "author",
+        "user",
+    ),
+}
 
-def load_author_prompt(path: Optional[str] = None) -> str:
-    path = path or Config.AUTHOR_PROMPT_PATH
+_prompts_cache: Optional[Dict[str, Any]] = None
+_prompts_cache_path: Optional[str] = None
+
+
+class PromptsLoadError(Exception):
+    """Файл промптов DeepSeek отсутствует, повреждён или невалиден."""
+
+
+def _fill(template: str, **kwargs: Any) -> str:
+    """Подставляет плейсхолдеры вида {name} без интерпретации прочих фигурных скобок."""
+    result = template
+    for key, value in kwargs.items():
+        result = result.replace("{" + key + "}", str(value))
+    return result
+
+
+def _validate_prompts(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Проверяет полноту схемы ключей; тексты инструкций в коде не хранятся."""
+    prompts: Dict[str, Any] = {}
+    problems: List[str] = []
+    for section, keys in _REQUIRED_PROMPT_KEYS.items():
+        loaded = data.get(section)
+        if not isinstance(loaded, dict):
+            problems.append(f"{section} (секция отсутствует или не mapping)")
+            continue
+        section_out: Dict[str, Any] = {}
+        for key in keys:
+            if key not in loaded or loaded[key] is None:
+                problems.append(f"{section}.{key}")
+                continue
+            value = loaded[key]
+            if not isinstance(value, str):
+                problems.append(f"{section}.{key} (ожидалась строка)")
+                continue
+            # partials_joiner хранит значимые \n — не strip.
+            if key != "partials_joiner":
+                value = value.strip()
+                if not value:
+                    problems.append(f"{section}.{key} (пустая строка)")
+                    continue
+            section_out[key] = value
+        prompts[section] = section_out
+    if problems:
+        raise PromptsLoadError(
+            "неполная или невалидная структура: " + ", ".join(problems)
+        )
+    return prompts
+
+
+def clear_prompts_cache() -> None:
+    """Сбрасывает кэш промптов (для тестов и смены PROMPTS_PATH)."""
+    global _prompts_cache, _prompts_cache_path
+    _prompts_cache = None
+    _prompts_cache_path = None
+
+
+def load_prompts(path: Optional[str] = None) -> Dict[str, Any]:
+    """Читает единый файл промптов DeepSeek. Без валидного файла — ошибка (без запасных текстов)."""
+    global _prompts_cache, _prompts_cache_path
+    path = path or Config.PROMPTS_PATH
+    if _prompts_cache is not None and _prompts_cache_path == path:
+        return _prompts_cache
+
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise PromptsLoadError("корень файла должен быть YAML mapping")
+        prompts = _validate_prompts(data)
     except FileNotFoundError:
-        logger.warning("Файл промпта автора не найден: %s", path)
-        return (
-            "Ты женщина с большим опытом в ИИ и разработке. Пиши от первого лица "
-            "на русском, как устная речь перед аудиторией. Названия продуктов оставляй "
-            "в оригинале. Без английских вставок вроде «это game changer»."
-        )
+        msg = f"Файл промптов DeepSeek не найден: {path}"
+        logger.error(msg)
+        raise PromptsLoadError(msg) from None
+    except PromptsLoadError as exc:
+        msg = f"Невалидные промпты DeepSeek ({path}): {exc}"
+        logger.error(msg)
+        raise PromptsLoadError(msg) from None
+    except Exception as exc:
+        msg = f"Не удалось прочитать промпты DeepSeek ({path}): {exc}"
+        logger.error(msg)
+        raise PromptsLoadError(msg) from exc
+
+    _prompts_cache = prompts
+    _prompts_cache_path = path
+    return prompts
+
+
+def load_author_prompt(path: Optional[str] = None) -> str:
+    """Голос автора из единого файла промптов (для совместимости и тестов)."""
+    prompts = load_prompts(path)
+    return str(prompts["articles_and_keywords"]["author"]).strip()
 
 
 def format_items_for_prompt(
@@ -84,54 +181,46 @@ class DeepSeekClient:
         if not chunks:
             return ""
 
+        prompts = load_prompts()["weekly_analysis"]
+
         if len(chunks) == 1:
-            prompt = (
-                "По материалам ниже напиши подробный разбор недели на русском: "
-                "о чём пишут, какие технологии появились, чем помогают, где применять. "
-                "Только текст разбора, без JSON.\n\n"
-                + format_items_for_prompt(chunks[0])
+            prompt = _fill(
+                prompts["user_single"],
+                materials=format_items_for_prompt(chunks[0]),
             )
             return self._chat(
                 [
-                    {
-                        "role": "system",
-                        "content": "Ты аналитик ИИ-новостей. Пиши подробно и по делу на русском.",
-                    },
+                    {"role": "system", "content": prompts["system_single"]},
                     {"role": "user", "content": prompt},
                 ]
             )
 
         partials = []
+        total = len(chunks)
         for idx, chunk in enumerate(chunks, 1):
-            prompt = (
-                f"Это часть {idx} из {len(chunks)} материалов недели. "
-                "Кратко, но содержательно выдели темы, технологии и применения. На русском.\n\n"
-                + format_items_for_prompt(chunk)
+            prompt = _fill(
+                prompts["user_partial"],
+                idx=idx,
+                total=total,
+                materials=format_items_for_prompt(chunk),
             )
             partials.append(
                 self._chat(
                     [
-                        {
-                            "role": "system",
-                            "content": "Ты аналитик ИИ-новостей. Пиши на русском.",
-                        },
+                        {"role": "system", "content": prompts["system_partial"]},
                         {"role": "user", "content": prompt},
                     ]
                 )
             )
 
-        merge_prompt = (
-            "Собери из черновиков один цельный подробный разбор недели на русском: "
-            "о чём пишут, какие технологии появились, чем помогают, где применять. "
-            "Без дублирования и без JSON.\n\n"
-            + "\n\n---\n\n".join(partials)
+        joiner = prompts.get("partials_joiner") or "\n\n---\n\n"
+        merge_prompt = _fill(
+            prompts["user_merge"],
+            partials=joiner.join(partials),
         )
         return self._chat(
             [
-                {
-                    "role": "system",
-                    "content": "Ты аналитик ИИ-новостей. Пиши подробно на русском.",
-                },
+                {"role": "system", "content": prompts["system_merge"]},
                 {"role": "user", "content": merge_prompt},
             ]
         )
@@ -145,34 +234,22 @@ class DeepSeekClient:
         author_prompt: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], List[str]]:
         n = articles_per_run if articles_per_run is not None else Config.ARTICLES_PER_RUN
-        author = author_prompt if author_prompt is not None else load_author_prompt()
+        prompts = load_prompts()["articles_and_keywords"]
+        author = author_prompt if author_prompt is not None else prompts["author"]
         materials = format_items_for_prompt(items)
         allowed_urls = _item_urls(items)
 
-        user_prompt = (
-            f"{author}\n\n"
-            f"Лимит статей: до {n}. Если полезных тем меньше — меньше; ноль допустим.\n"
-            "Верни строго JSON-объект:\n"
-            '{"articles":[{"title":"...","body":"...","rationale":"...",'
-            '"source_urls":["https://..."]}],'
-            '"keywords":["фраза1","фраза2"]}\n'
-            "У каждой статьи source_urls — список URL из поля URL материалов выше, "
-            "на которых основан текст статьи. Бери только URL из материалов; "
-            "если опиралась на материал без URL — оставь source_urls пустым массивом.\n"
-            "keywords — новые технологии и формулировки из материалов, которых ещё нет "
-            "в известных списках; короткие фразы для поиска.\n\n"
-            f"Разбор недели:\n{summary}\n\nМатериалы:\n{materials}"
+        user_prompt = _fill(
+            prompts["user"],
+            author=author,
+            n=n,
+            summary=summary,
+            materials=materials,
         )
 
         raw = self._chat(
             [
-                {
-                    "role": "system",
-                    "content": (
-                        "Отвечай только валидным JSON без markdown-ограждений. "
-                        "Статьи — на русском, голос автора из инструкции пользователя."
-                    ),
-                },
+                {"role": "system", "content": prompts["system"]},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.8,

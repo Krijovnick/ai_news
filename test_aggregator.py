@@ -326,6 +326,105 @@ class ArticleSourceUrlsTests(unittest.TestCase):
         )
 
 
+class DeepSeekPromptsTests(unittest.TestCase):
+    """Единый YAML промптов: загрузка, плейсхолдеры; без файла/битый — ошибка."""
+
+    def tearDown(self):
+        from utils.deepseek import clear_prompts_cache
+
+        clear_prompts_cache()
+
+    def test_load_default_prompts_file(self):
+        from utils.deepseek import clear_prompts_cache, load_author_prompt, load_prompts
+
+        clear_prompts_cache()
+        prompts = load_prompts()
+        self.assertIn("weekly_analysis", prompts)
+        self.assertIn("articles_and_keywords", prompts)
+        self.assertIn("{materials}", prompts["weekly_analysis"]["user_single"])
+        self.assertIn("{partials}", prompts["weekly_analysis"]["user_merge"])
+        self.assertEqual(prompts["weekly_analysis"]["partials_joiner"], "\n\n---\n\n")
+        author = load_author_prompt()
+        self.assertIn("первого лица", author)
+        self.assertIn("{author}", prompts["articles_and_keywords"]["user"])
+        self.assertIn("{n}", prompts["articles_and_keywords"]["user"])
+
+    def test_missing_file_raises_and_logs(self):
+        from utils.deepseek import PromptsLoadError, clear_prompts_cache, load_prompts
+
+        clear_prompts_cache()
+        missing = os.path.join(tempfile.gettempdir(), "ai_news_no_prompts.yaml")
+        with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+            with self.assertRaises(PromptsLoadError) as ctx:
+                load_prompts(missing)
+        self.assertTrue(any("не найден" in m for m in cm.output))
+        self.assertIn("не найден", str(ctx.exception))
+
+    def test_invalid_yaml_raises_and_logs(self):
+        from utils.deepseek import PromptsLoadError, clear_prompts_cache, load_prompts
+
+        clear_prompts_cache()
+        path = os.path.join(tempfile.gettempdir(), "ai_news_bad_prompts.yaml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("weekly_analysis: [\n  broken")
+        try:
+            with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+                with self.assertRaises(PromptsLoadError):
+                    load_prompts(path)
+            self.assertTrue(any("Не удалось прочитать" in m for m in cm.output))
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_incomplete_structure_raises(self):
+        from utils.deepseek import PromptsLoadError, clear_prompts_cache, load_prompts
+
+        clear_prompts_cache()
+        path = os.path.join(tempfile.gettempdir(), "ai_news_incomplete_prompts.yaml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("weekly_analysis:\n  system_single: only one key\n")
+        try:
+            with self.assertLogs("utils.deepseek", level="ERROR"):
+                with self.assertRaises(PromptsLoadError) as ctx:
+                    load_prompts(path)
+            self.assertIn("невалидн", str(ctx.exception).lower())
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def test_build_weekly_uses_templates(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        captured = []
+
+        def fake_chat(messages, temperature=0.7):
+            captured.append(messages)
+            return "разбор"
+
+        client._chat = fake_chat
+        items = [
+            {
+                "title": "Тема",
+                "source": "HN",
+                "url": "https://example.com/1",
+                "description": "Текст материала",
+            }
+        ]
+        result = client.build_weekly_analysis(items)
+        self.assertEqual(result, "разбор")
+        self.assertEqual(len(captured), 1)
+        user = captured[0][1]["content"]
+        self.assertIn("подробный разбор недели", user)
+        self.assertIn("https://example.com/1", user)
+        self.assertIn("Тема", user)
+
+
 class SslTrustTests(unittest.TestCase):
     def test_use_system_certificates_calls_truststore_inject(self):
         from unittest.mock import MagicMock, patch

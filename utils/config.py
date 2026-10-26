@@ -61,7 +61,7 @@ class Config:
     # Пути
     DATA_DIR = os.getenv("DATA_DIR", "data")
     DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "news.db"))
-    AUTHOR_PROMPT_PATH = os.getenv("AUTHOR_PROMPT_PATH", os.path.join("prompts", "author.txt"))
+    PROMPTS_PATH = os.getenv("PROMPTS_PATH", os.path.join("prompts", "deepseek.yaml"))
     WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
     WEB_PORT = int(os.getenv("WEB_PORT", "5050"))
     WEB_URL = os.getenv("WEB_URL", f"http://{WEB_HOST}:{WEB_PORT}")
