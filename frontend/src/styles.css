@@ -194,3 +194,58 @@ header .header-menu {
 .manual-panel .error {
   white-space: pre-wrap;
 }
+.article-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 1.25rem;
+}
+.article-error {
+  white-space: pre-wrap;
+  margin-top: 1rem;
+  margin-bottom: 0;
+}
+.article-edit label {
+  display: block;
+  margin-bottom: 0.85rem;
+  font-weight: 600;
+}
+.article-edit input[type=text],
+.article-edit input[type=url],
+.article-edit textarea {
+  display: block;
+  width: 100%;
+  margin-top: 0.25rem;
+  padding: 0.4rem 0.5rem;
+  font: inherit;
+  font-weight: normal;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink);
+}
+.article-edit textarea {
+  resize: vertical;
+}
+.article-edit-urls {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+  margin: 0;
+}
+.article-edit-urls legend {
+  font-weight: 600;
+  padding: 0 0.3rem;
+}
+.article-edit-url {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+.article-edit-url input[type=url] {
+  margin-top: 0;
+  flex: 1;
+  min-width: 0;
+}

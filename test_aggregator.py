@@ -276,20 +276,21 @@ class ArticleSourceUrlsTests(unittest.TestCase):
         one = self.db.get_article(articles[0]["id"])
         self.assertEqual(one["source_urls"], articles[0]["source_urls"])
 
-    def test_parse_keeps_only_allowed_item_urls(self):
-        from utils.deepseek import _parse_articles_payload
+    def test_plan_ignores_unknown_and_reused_item_ids(self):
+        from utils.deepseek import _parse_plan_payload
 
         raw = (
-            '{"articles":[{"title":"Т","body":"Б","rationale":"",'
-            '"source_urls":["https://ok.example/x","https://fake.example/y"]}],'
-            '"keywords":[]}'
+            '{"topics":['
+            '{"topic":"А","angle":"","why_together":"","item_ids":[1,2,99]},'
+            '{"topic":"Б","angle":"","why_together":"","item_ids":[2]},'
+            '{"topic":"В","angle":"","why_together":"","item_ids":["3"]}'
+            '],"keywords":["фраза"]}'
         )
-        articles, _ = _parse_articles_payload(
-            raw,
-            max_articles=5,
-            allowed_urls=["https://ok.example/x"],
-        )
-        self.assertEqual(articles[0]["source_urls"], ["https://ok.example/x"])
+        topics, keywords = _parse_plan_payload(raw, item_count=3)
+        self.assertEqual([t["topic"] for t in topics], ["А", "В"])
+        self.assertEqual(topics[0]["item_indexes"], [0, 1])
+        self.assertEqual(topics[1]["item_indexes"], [2])
+        self.assertEqual(keywords, ["фраза"])
 
     def test_api_article_returns_source_urls(self):
         import web as web_mod
@@ -329,9 +330,17 @@ class ArticleSourceUrlsTests(unittest.TestCase):
 class DeepSeekPromptsTests(unittest.TestCase):
     """Единый YAML промптов: загрузка, плейсхолдеры; без файла/битый — ошибка."""
 
+    def setUp(self):
+        from utils.config import Config
+
+        # По умолчанию без Search/Fetch: тесты не ходят в сеть; нужные тесты включают явно.
+        self._web_patch = patch.object(Config, "DEEPSEEK_WEB_TOOLS", False)
+        self._web_patch.start()
+
     def tearDown(self):
         from utils.deepseek import clear_prompts_cache
 
+        self._web_patch.stop()
         clear_prompts_cache()
 
     def test_load_default_prompts_file(self):
@@ -346,8 +355,9 @@ class DeepSeekPromptsTests(unittest.TestCase):
         self.assertEqual(prompts["weekly_analysis"]["partials_joiner"], "\n\n---\n\n")
         author = load_author_prompt()
         self.assertIn("первого лица", author)
-        self.assertIn("{author}", prompts["articles_and_keywords"]["user"])
-        self.assertIn("{n}", prompts["articles_and_keywords"]["user"])
+        self.assertIn("{author}", prompts["articles_and_keywords"]["write_user"])
+        self.assertIn("{recent_titles}", prompts["articles_and_keywords"]["plan_user"])
+        self.assertIn("{materials}", prompts["articles_and_keywords"]["write_user"])
 
     def test_missing_file_raises_and_logs(self):
         from utils.deepseek import PromptsLoadError, clear_prompts_cache, load_prompts
@@ -423,6 +433,323 @@ class DeepSeekPromptsTests(unittest.TestCase):
         self.assertIn("подробный разбор недели", user)
         self.assertIn("https://example.com/1", user)
         self.assertIn("Тема", user)
+
+    def test_articles_one_request_per_topic_with_own_materials(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        captured = []
+        plan = (
+            '{"topics":['
+            '{"topic":"Агент удалил базу","angle":"права","why_together":"один инцидент","item_ids":[1,3]},'
+            '{"topic":"Галлюцинация в поддержке","angle":"проверка","why_together":"","item_ids":[2]}'
+            '],"keywords":["агентные права"]}'
+        )
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            captured.append(messages[1]["content"])
+            if len(captured) == 1:
+                return plan
+            return '{"title":"Заголовок","body":"Текст","rationale":"важно"}'
+
+        client._chat = fake_chat
+        items = [
+            {"title": "Агент стёр прод", "url": "https://a.example/1", "description": "x"},
+            {"title": "Бот выдумал скидку", "url": "https://b.example/2", "description": "y"},
+            {"title": "Ещё про стёртый прод", "url": "https://a.example/3", "description": "z"},
+        ]
+        articles, keywords = client.build_articles_and_keywords(
+            items, "разбор", recent_titles=["Старая статья"]
+        )
+        self.assertEqual(len(captured), 3)
+        self.assertIn("Старая статья", captured[0])
+        self.assertNotIn("{n}", captured[0])
+        self.assertNotIn("{limit}", captured[0])
+        self.assertIn("Агент стёр прод", captured[1])
+        self.assertIn("Ещё про стёртый прод", captured[1])
+        self.assertNotIn("Бот выдумал скидку", captured[1])
+        self.assertEqual(len(articles), 2)
+        self.assertEqual(
+            articles[0]["source_urls"], ["https://a.example/1", "https://a.example/3"]
+        )
+        self.assertEqual(articles[1]["source_urls"], ["https://b.example/2"])
+        self.assertEqual(keywords, ["агентные права"])
+
+    _TWO_TOPICS_PLAN = (
+        '{"topics":['
+        '{"topic":"Первая","angle":"а","why_together":"","item_ids":[1]},'
+        '{"topic":"Вторая","angle":"б","why_together":"","item_ids":[2]}'
+        '],"keywords":[]}'
+    )
+    _TWO_ITEMS = [
+        {"title": "Материал 1", "url": "https://a.example/1", "description": "x"},
+        {"title": "Материал 2", "url": "https://b.example/2", "description": "y"},
+    ]
+
+    def test_articles_per_run_limits_topics(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return self._TWO_TOPICS_PLAN
+            return '{"title":"Заголовок","body":"Текст","rationale":""}'
+
+        client._chat = fake_chat
+        articles, _ = client.build_articles_and_keywords(
+            self._TWO_ITEMS, "разбор", articles_per_run=1
+        )
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(articles[0]["source_urls"], ["https://a.example/1"])
+
+    def test_failed_article_request_skips_only_that_article(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return self._TWO_TOPICS_PLAN
+            if len(calls) == 3:
+                raise requests.ConnectionError("network unreachable")
+            return '{"title":"Первая статья","body":"Текст","rationale":""}'
+
+        client._chat = fake_chat
+        with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+            articles, _ = client.build_articles_and_keywords(self._TWO_ITEMS, "разбор")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([a["title"] for a in articles], ["Первая статья"])
+        self.assertTrue(any("Вторая" in m and "не написана" in m for m in cm.output))
+
+    def test_chat_logs_truncation_by_max_tokens(self):
+        from utils.deepseek import DeepSeekClient
+
+        client = DeepSeekClient(api_key="test-key")
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "choices": [
+                {"finish_reason": "length", "message": {"content": " обрезанный ответ "}}
+            ]
+        }
+        with patch("utils.deepseek.requests.post", return_value=resp):
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                result = client._chat([{"role": "user", "content": "x"}], max_tokens=8192)
+        self.assertEqual(result, "обрезанный ответ")
+        self.assertTrue(any("обрезан" in m and "8192" in m for m in cm.output))
+
+    def test_empty_plan_gives_no_articles(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            calls.append(1)
+            return '{"topics":[],"keywords":[]}'
+
+        client._chat = fake_chat
+        articles, _ = client.build_articles_and_keywords(
+            [{"title": "Т", "url": "", "description": ""}], "разбор"
+        )
+        self.assertEqual(articles, [])
+        self.assertEqual(len(calls), 1)
+
+    @staticmethod
+    def _tool_response(payload):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = payload
+        return resp
+
+    def test_plan_has_only_titles_without_item_texts(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        captured = []
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            captured.append(messages[1]["content"])
+            return '{"topics":[],"keywords":[]}'
+
+        client._chat = fake_chat
+        items = [
+            {
+                "title": "Заголовок новости",
+                "source": "HN",
+                "url": "https://a.example/1",
+                "description": "СЕКРЕТНЫЙ-ТЕКСТ-МАТЕРИАЛА",
+            }
+        ]
+        client.build_articles_and_keywords(items, "разбор", articles_per_run=5)
+        self.assertEqual(len(captured), 1)
+        self.assertIn("Заголовок новости", captured[0])
+        self.assertIn("[HN]", captured[0])
+        self.assertIn("5", captured[0])
+        self.assertNotIn("СЕКРЕТНЫЙ-ТЕКСТ-МАТЕРИАЛА", captured[0])
+        self.assertNotIn("https://a.example/1", captured[0])
+
+    def test_topics_cut_to_limit_in_model_order(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        plan = (
+            '{"topics":['
+            '{"topic":"Т3","angle":"","why_together":"","item_ids":[3]},'
+            '{"topic":"Т1","angle":"","why_together":"","item_ids":[1]},'
+            '{"topic":"Т2","angle":"","why_together":"","item_ids":[2]}'
+            '],"keywords":[]}'
+        )
+        captured = []
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            captured.append(messages[1]["content"])
+            if len(captured) == 1:
+                return plan
+            return '{"title":"З","body":"Т","rationale":""}'
+
+        client._chat = fake_chat
+        items = [
+            {"title": f"Материал {i}", "url": f"https://x.example/{i}", "description": ""}
+            for i in (1, 2, 3)
+        ]
+        with self.assertLogs("utils.deepseek", level="INFO") as cm:
+            articles, _ = client.build_articles_and_keywords(
+                items, "разбор", articles_per_run=2
+            )
+        self.assertEqual(len(captured), 3)
+        self.assertIn("Тема: Т3", captured[1])
+        self.assertIn("Тема: Т1", captured[2])
+        self.assertEqual(
+            [a["source_urls"] for a in articles],
+            [["https://x.example/3"], ["https://x.example/1"]],
+        )
+        log = "\n".join(cm.output)
+        self.assertIn("Т3", log)
+        self.assertIn("https://x.example/3", log)
+        self.assertNotIn("Т2", log)
+
+    _SEARCH_PLAN = (
+        '{"topics":[{"topic":"Релиз","angle":"а","why_together":"",'
+        '"item_ids":[1],"search_queries":["release details"]}],"keywords":[]}'
+    )
+    _ONE_ITEM = [
+        {"title": "Материал 1", "url": "https://a.example/1", "description": "RSS-ТЕКСТ"}
+    ]
+
+    def _client_with_article_capture(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        captured = []
+
+        def fake_chat(messages, temperature=0.7, max_tokens=None):
+            captured.append(messages[1]["content"])
+            if len(captured) == 1:
+                return self._SEARCH_PLAN
+            return '{"title":"Статья","body":"Текст","rationale":""}'
+
+        client._chat = fake_chat
+        return client, captured
+
+    def test_fetch_and_search_results_reach_article_and_source_urls(self):
+        from utils.deepseek import FETCH_URL, SEARCH_URL
+
+        client, captured = self._client_with_article_capture()
+        search_payload = {
+            "results": [
+                {"rerank_score": 2.5, "title": "Хороший", "url": "https://s.example/good",
+                 "content": "ПОИСК-КОНТЕНТ", "summary": "x"},
+                {"rerank_score": 1.0, "title": "Слабый", "url": "https://s.example/weak",
+                 "content": "СЛАБЫЙ-КОНТЕНТ"},
+                {"rerank_score": 1.5, "title": "Дубль", "url": "https://a.example/1",
+                 "content": "ДУБЛЬ-КОНТЕНТ"},
+                {"rerank_score": 1.5, "title": "Саммари", "url": "https://s.example/sum",
+                 "content": "", "summary": "ПОИСК-САММАРИ"},
+            ]
+        }
+        posted = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            posted.append((url, json))
+            if url == FETCH_URL:
+                return self._tool_response({"title": "t", "content": "ПОЛНЫЙ-ТЕКСТ"})
+            if url == SEARCH_URL:
+                return self._tool_response(search_payload)
+            raise AssertionError(url)
+
+        with patch("utils.deepseek.requests.post", side_effect=fake_post):
+            articles, _ = client.build_articles_and_keywords(
+                self._ONE_ITEM, "разбор", web_tools=True
+            )
+        self.assertEqual(posted[0], (FETCH_URL, {"url": "https://a.example/1"}))
+        self.assertEqual(posted[1][0], SEARCH_URL)
+        self.assertEqual(posted[1][1]["query"], "release details")
+        self.assertTrue(posted[1][1]["need_content"])
+        prompt = captured[1]
+        self.assertIn("RSS-ТЕКСТ", prompt)
+        self.assertIn("ПОЛНЫЙ-ТЕКСТ", prompt)
+        self.assertIn("ПОИСК-КОНТЕНТ", prompt)
+        self.assertIn("ПОИСК-САММАРИ", prompt)
+        self.assertNotIn("СЛАБЫЙ-КОНТЕНТ", prompt)
+        self.assertNotIn("ДУБЛЬ-КОНТЕНТ", prompt)
+        self.assertEqual(
+            articles[0]["source_urls"],
+            ["https://a.example/1", "https://s.example/good", "https://s.example/sum"],
+        )
+
+    def test_fetch_and_search_errors_do_not_break_article(self):
+        client, captured = self._client_with_article_capture()
+        err_resp = MagicMock()
+        err_resp.raise_for_status.side_effect = requests.HTTPError("429 Too Many Requests")
+
+        with patch("utils.deepseek.requests.post", return_value=err_resp):
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._ONE_ITEM, "разбор", web_tools=True
+                )
+        self.assertEqual(len(articles), 1)
+        self.assertEqual(articles[0]["source_urls"], ["https://a.example/1"])
+        self.assertIn("RSS-ТЕКСТ", captured[1])
+        self.assertTrue(any("Fetch" in m for m in cm.output))
+        self.assertTrue(any("Search" in m for m in cm.output))
+
+    def test_web_tools_disabled_makes_no_tool_requests(self):
+        from utils.config import Config
+
+        client, captured = self._client_with_article_capture()
+        with patch.object(Config, "DEEPSEEK_WEB_TOOLS", False):
+            with patch("utils.deepseek.requests.post") as post:
+                articles, _ = client.build_articles_and_keywords(self._ONE_ITEM, "разбор")
+        post.assert_not_called()
+        self.assertEqual(len(articles), 1)
+        self.assertIn("RSS-ТЕКСТ", captured[1])
+        self.assertEqual(articles[0]["source_urls"], ["https://a.example/1"])
+
+    def test_plan_parses_search_queries(self):
+        from utils.deepseek import _parse_plan_payload
+
+        raw = (
+            '{"topics":[{"topic":"А","item_ids":[1],'
+            '"search_queries":["  q1 ", "", "' + "x" * 200 + '", "q3"]},'
+            '{"topic":"Б","item_ids":[2]}],"keywords":[]}'
+        )
+        topics, _ = _parse_plan_payload(raw, item_count=2)
+        self.assertEqual(topics[0]["search_queries"], ["q1", "x" * 128])
+        self.assertEqual(topics[1]["search_queries"], [])
 
 
 class SslTrustTests(unittest.TestCase):
@@ -920,6 +1247,152 @@ class ManualRunTests(unittest.TestCase):
         self.assertIn("Использованные ссылки", src)
         self.assertIn("source_urls", src)
         self.assertIn("sourceUrls", src)
+
+
+class ArticleEditApiTests(unittest.TestCase):
+    """Правка и удаление статьи через JSON API, временная БД."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "test.db")
+        self.db = NewsDatabase(self.db_path)
+        import web as web_mod
+
+        self.web_mod = web_mod
+        self._orig_get_db = web_mod.get_db
+        web_mod.get_db = lambda: self.db
+        self.client = web_mod.app.test_client()
+        self.run_id = self.db.create_run(7)
+        self.db.save_articles(
+            self.run_id,
+            [
+                {
+                    "title": "Старый заголовок",
+                    "body": "Старый текст",
+                    "rationale": "Старое обоснование",
+                    "source_urls": ["https://old.example/a"],
+                }
+            ],
+        )
+        self.article_id = self.db.get_articles_for_run(self.run_id)[0]["id"]
+
+    def tearDown(self):
+        self.web_mod.get_db = self._orig_get_db
+        self.db.close()
+        self._tmp.cleanup()
+
+    def _put(self, article_id, payload):
+        return self.client.put(
+            f"/api/articles/{article_id}",
+            json=payload,
+            headers={"X-Requested-With": "fetch"},
+        )
+
+    def test_update_normalizes_source_urls(self):
+        resp = self._put(
+            self.article_id,
+            {
+                "title": "  Новый заголовок ",
+                "body": " Новый текст\nвторая строка ",
+                "rationale": " Новое обоснование ",
+                "source_urls": [
+                    "  https://a.example/1  ",
+                    "",
+                    "   ",
+                    "http://b.example/2",
+                    "https://a.example/1",
+                    "https://c.example/3",
+                ],
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        expected_urls = [
+            "https://a.example/1",
+            "http://b.example/2",
+            "https://c.example/3",
+        ]
+        self.assertEqual(data["article"]["source_urls"], expected_urls)
+        self.assertEqual(data["article"]["title"], "Новый заголовок")
+        stored = self.db.get_article(self.article_id)
+        self.assertEqual(stored["title"], "Новый заголовок")
+        self.assertEqual(stored["body"], "Новый текст\nвторая строка")
+        self.assertEqual(stored["rationale"], "Новое обоснование")
+        self.assertEqual(stored["source_urls"], expected_urls)
+
+        resp = self._put(
+            self.article_id,
+            {"title": "Т", "body": "Б", "source_urls": []},
+        )
+        self.assertEqual(resp.status_code, 200)
+        stored = self.db.get_article(self.article_id)
+        self.assertEqual(stored["source_urls"], [])
+        self.assertEqual(stored["rationale"], "Новое обоснование")
+
+    def test_invalid_url_rejected_without_changes(self):
+        for bad in ("ftp://files.example/x", "javascript:alert(1)", "example.com/page"):
+            resp = self._put(
+                self.article_id,
+                {"title": "Новый", "body": "Текст", "source_urls": ["https://ok.example", bad]},
+            )
+            self.assertEqual(resp.status_code, 400, bad)
+            data = resp.get_json()
+            self.assertFalse(data["ok"])
+            self.assertIn("Некорректная ссылка", data["error"])
+            self.assertIn(bad, data["error"])
+        stored = self.db.get_article(self.article_id)
+        self.assertEqual(stored["title"], "Старый заголовок")
+        self.assertEqual(stored["source_urls"], ["https://old.example/a"])
+
+    def test_empty_title_or_body_rejected(self):
+        resp = self._put(self.article_id, {"title": "   ", "body": "Текст", "source_urls": []})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Заголовок", resp.get_json()["error"])
+        resp = self._put(self.article_id, {"title": "Заголовок", "body": "  ", "source_urls": []})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Текст", resp.get_json()["error"])
+        resp = self.client.put(f"/api/articles/{self.article_id}", data="not json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["ok"])
+        self.assertEqual(self.db.get_article(self.article_id)["title"], "Старый заголовок")
+
+    def test_missing_article_returns_404(self):
+        resp = self._put(99999, {"title": "Т", "body": "Б", "source_urls": []})
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.get_json(), {"ok": False, "error": "Статья не найдена"})
+        resp = self.client.delete("/api/articles/99999")
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(resp.get_json()["ok"])
+
+    def test_delete_removes_article_from_run(self):
+        resp = self.client.delete(
+            f"/api/articles/{self.article_id}", headers={"X-Requested-With": "fetch"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json(), {"ok": True})
+        self.assertIsNone(self.db.get_article(self.article_id))
+        self.assertEqual(self.client.get(f"/api/articles/{self.article_id}").status_code, 404)
+        run_data = self.client.get(f"/api/runs/{self.run_id}").get_json()
+        self.assertEqual(run_data["articles"], [])
+
+    def test_article_view_has_edit_and_delete_without_v_html(self):
+        src_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "frontend",
+            "src",
+            "views",
+            "ArticleView.vue",
+        )
+        with open(src_path, encoding="utf-8") as f:
+            src = f.read()
+        for text in ("Редактировать", "Сохранить", "Отмена", "Добавить ссылку", "Удалить пост"):
+            self.assertIn(text, src)
+        self.assertIn("is-busy", src)
+        self.assertIn("confirm(", src)
+        self.assertIn('method: "DELETE"', src)
+        self.assertIn('method: "PUT"', src)
+        self.assertNotIn("v-html", src)
 
 
 def main():

@@ -7,6 +7,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 
 from utils.config import Config, SEED_KEYWORDS
 
@@ -43,6 +44,41 @@ def _parse_source_urls(raw: Any) -> List[str]:
     if not isinstance(data, list):
         return []
     return [str(u).strip() for u in data if str(u or "").strip()]
+
+
+ARTICLE_TITLE_EMPTY_ERROR = "Заголовок не может быть пустым"
+ARTICLE_BODY_EMPTY_ERROR = "Текст статьи не может быть пустым"
+ARTICLE_URLS_NOT_LIST_ERROR = "Ссылки нужно передать списком"
+
+
+def normalize_article_urls(value: Any) -> List[str]:
+    """Ссылки статьи из правки: срез пробелов, без пустых и дублей, только http(s).
+
+    Невалидная ссылка — ValueError с сообщением на русском.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(ARTICLE_URLS_NOT_LIST_ERROR)
+    urls: List[str] = []
+    for item in value:
+        if item is None:
+            continue
+        if not isinstance(item, str):
+            raise ValueError(ARTICLE_URLS_NOT_LIST_ERROR)
+        url = item.strip()
+        if not url:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc or any(
+            ch.isspace() for ch in url
+        ):
+            raise ValueError(
+                f"Некорректная ссылка: {url}. Нужен адрес, начинающийся с http:// или https://"
+            )
+        if url not in urls:
+            urls.append(url)
+    return urls
 
 
 def _article_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
@@ -379,11 +415,68 @@ class NewsDatabase:
         ).fetchall()
         return [_article_row_to_dict(r) for r in rows]
 
+    def get_recent_article_titles(self, limit: int = 40) -> List[str]:
+        """Заголовки последних статей — чтобы новый прогон не повторял темы."""
+        rows = self._conn.execute(
+            "SELECT title FROM articles ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [r["title"] for r in rows]
+
     def get_article(self, article_id: int) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
             "SELECT * FROM articles WHERE id = ?", (article_id,)
         ).fetchone()
         return _article_row_to_dict(row) if row else None
+
+    def update_article(
+        self,
+        article_id: int,
+        title: Any,
+        body: Any,
+        rationale: Any = None,
+        source_urls: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Правка статьи из веба. None — статьи нет; ValueError — невалидные данные.
+
+        rationale=None или source_urls=None оставляют прежнее значение поля.
+        """
+        current = self.get_article(article_id)
+        if current is None:
+            return None
+        clean_title = str(title or "").strip()
+        clean_body = str(body or "").strip()
+        if not clean_title:
+            raise ValueError(ARTICLE_TITLE_EMPTY_ERROR)
+        if not clean_body:
+            raise ValueError(ARTICLE_BODY_EMPTY_ERROR)
+        urls = (
+            current["source_urls"] if source_urls is None else normalize_article_urls(source_urls)
+        )
+        if rationale is None:
+            self._conn.execute(
+                "UPDATE articles SET title = ?, body = ?, source_urls = ? WHERE id = ?",
+                (clean_title, clean_body, json.dumps(urls, ensure_ascii=False), article_id),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE articles SET title = ?, body = ?, rationale = ?, source_urls = ? "
+                "WHERE id = ?",
+                (
+                    clean_title,
+                    clean_body,
+                    str(rationale).strip(),
+                    json.dumps(urls, ensure_ascii=False),
+                    article_id,
+                ),
+            )
+        self._conn.commit()
+        return self.get_article(article_id)
+
+    def delete_article(self, article_id: int) -> bool:
+        """Удаляет статью по id. False — статьи не было."""
+        cur = self._conn.execute("DELETE FROM articles WHERE id = ?", (article_id,))
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def list_runs(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(

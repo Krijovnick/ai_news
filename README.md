@@ -29,7 +29,7 @@
 
 ## Переменные окружения
 
-Секреты и флаги задаются в `.env` (имена в `utils/config.py`): Telegram, Reddit, `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`, `ARTICLES_PER_RUN`, `ENABLE_*` для источников.
+Секреты и флаги задаются в `.env` (имена в `utils/config.py`): Telegram, Reddit, `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL`, `ARTICLES_PER_RUN`, `ARTICLE_ITEM_TEXT_CHARS`, `DEEPSEEK_WEB_TOOLS`, `ARTICLE_SEARCH_RESULTS`, `ENABLE_*` для источников.
 
 ## Логи и данные
 

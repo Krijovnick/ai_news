@@ -167,7 +167,11 @@ class AINewsAggregator:
 
             client = DeepSeekClient()
             summary = client.build_weekly_analysis(processed)
-            articles, proposed = client.build_articles_and_keywords(processed, summary)
+            articles, proposed = client.build_articles_and_keywords(
+                processed,
+                summary,
+                recent_titles=self.db.get_recent_article_titles(),
+            )
 
             self.db.save_summary(run_id, summary)
             self.db.save_articles(run_id, articles)

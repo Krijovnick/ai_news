@@ -43,7 +43,16 @@ class Config:
     # DeepSeek
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
     DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    # Потолок топа тем: модель ранжирует темы и отдаёт не больше стольких (0 — без потолка).
     ARTICLES_PER_RUN = int(os.getenv("ARTICLES_PER_RUN", "5"))
+    # Search/Fetch API DeepSeek для сбора текстов статей (true/1 — включено).
+    DEEPSEEK_WEB_TOOLS = os.getenv("DEEPSEEK_WEB_TOOLS", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    # Сколько результатов поиска (rerank_score >= 1.5) брать на один поисковый запрос.
+    ARTICLE_SEARCH_RESULTS = int(os.getenv("ARTICLE_SEARCH_RESULTS", "3"))
 
     # Reddit API
     REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
@@ -178,6 +187,8 @@ class Config:
     REDDIT_AI_MAX = int(os.getenv("REDDIT_AI_MAX", "50"))
     REDDIT_BUSINESS_MAX = int(os.getenv("REDDIT_BUSINESS_MAX", "50"))
     ITEM_TEXT_PROMPT_CHARS = int(os.getenv("ITEM_TEXT_PROMPT_CHARS", "800"))
+    # Текст материала в запросе на одну статью: материалов там мало, можно дать больше.
+    ARTICLE_ITEM_TEXT_CHARS = int(os.getenv("ARTICLE_ITEM_TEXT_CHARS", "4000"))
 
     PRACTICAL_KEYWORDS = [
         "automat",

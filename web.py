@@ -17,6 +17,8 @@ from utils.config import Config, setup_logging
 from utils.db import NewsDatabase, group_runs_by_iso_week
 
 MANUAL_PAIRS_ERROR = "Нужна хотя бы одна пара заголовка и текста"
+ARTICLE_NOT_FOUND_ERROR = "Статья не найдена"
+ARTICLE_PAYLOAD_ERROR = "Нужен JSON с полями title, body и source_urls"
 
 DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 _DIST_MISSING = (
@@ -93,8 +95,37 @@ def api_article(article_id: int):
     db = get_db()
     article = db.get_article(article_id)
     if not article:
-        return jsonify({"error": "Статья не найдена"}), 404
+        return jsonify({"error": ARTICLE_NOT_FOUND_ERROR}), 404
     return jsonify({"article": article})
+
+
+@app.route("/api/articles/<int:article_id>", methods=["PUT", "PATCH"])
+def api_article_update(article_id: int):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": ARTICLE_PAYLOAD_ERROR}), 400
+    db = get_db()
+    try:
+        article = db.update_article(
+            article_id,
+            title=payload.get("title"),
+            body=payload.get("body"),
+            rationale=payload.get("rationale"),
+            source_urls=payload.get("source_urls"),
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if article is None:
+        return jsonify({"ok": False, "error": ARTICLE_NOT_FOUND_ERROR}), 404
+    return jsonify({"ok": True, "article": article}), 200
+
+
+@app.route("/api/articles/<int:article_id>", methods=["DELETE"])
+def api_article_delete(article_id: int):
+    db = get_db()
+    if not db.delete_article(article_id):
+        return jsonify({"ok": False, "error": ARTICLE_NOT_FOUND_ERROR}), 404
+    return jsonify({"ok": True}), 200
 
 
 @app.route("/api/keywords")
