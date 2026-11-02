@@ -18,6 +18,7 @@ from utils.db import NewsDatabase, group_runs_by_iso_week
 
 MANUAL_PAIRS_ERROR = "Нужна хотя бы одна пара заголовка и текста"
 ARTICLE_NOT_FOUND_ERROR = "Статья не найдена"
+RUN_NOT_FOUND_ERROR = "Прогон не найден"
 ARTICLE_PAYLOAD_ERROR = "Нужен JSON с полями title, body и source_urls"
 
 DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
@@ -84,10 +85,31 @@ def api_run(run_id: int):
     db = get_db()
     run = db.get_run(run_id)
     if not run:
-        return jsonify({"error": "Прогон не найден"}), 404
+        return jsonify({"error": RUN_NOT_FOUND_ERROR}), 404
     summary = db.get_summary(run_id) or ""
     articles = db.get_articles_for_run(run_id)
     return jsonify({"run": run, "summary": summary, "articles": articles})
+
+
+@app.route("/api/runs/<int:run_id>/articles", methods=["POST"])
+def api_run_article_create(run_id: int):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": ARTICLE_PAYLOAD_ERROR}), 400
+    db = get_db()
+    try:
+        article = db.create_article(
+            run_id,
+            title=payload.get("title"),
+            body=payload.get("body"),
+            rationale=payload.get("rationale"),
+            source_urls=payload.get("source_urls"),
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if article is None:
+        return jsonify({"ok": False, "error": RUN_NOT_FOUND_ERROR}), 404
+    return jsonify({"ok": True, "article": article}), 201
 
 
 @app.route("/api/articles/<int:article_id>")

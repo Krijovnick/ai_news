@@ -81,6 +81,17 @@ def normalize_article_urls(value: Any) -> List[str]:
     return urls
 
 
+def _clean_article_text(title: Any, body: Any) -> Tuple[str, str]:
+    """Заголовок и текст статьи из веба: срез пробелов; пустые — ValueError."""
+    clean_title = str(title or "").strip()
+    clean_body = str(body or "").strip()
+    if not clean_title:
+        raise ValueError(ARTICLE_TITLE_EMPTY_ERROR)
+    if not clean_body:
+        raise ValueError(ARTICLE_BODY_EMPTY_ERROR)
+    return clean_title, clean_body
+
+
 def _article_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     data = dict(row)
     data["source_urls"] = _parse_source_urls(data.get("source_urls"))
@@ -443,12 +454,7 @@ class NewsDatabase:
         current = self.get_article(article_id)
         if current is None:
             return None
-        clean_title = str(title or "").strip()
-        clean_body = str(body or "").strip()
-        if not clean_title:
-            raise ValueError(ARTICLE_TITLE_EMPTY_ERROR)
-        if not clean_body:
-            raise ValueError(ARTICLE_BODY_EMPTY_ERROR)
+        clean_title, clean_body = _clean_article_text(title, body)
         urls = (
             current["source_urls"] if source_urls is None else normalize_article_urls(source_urls)
         )
@@ -471,6 +477,36 @@ class NewsDatabase:
             )
         self._conn.commit()
         return self.get_article(article_id)
+
+    def create_article(
+        self,
+        run_id: int,
+        title: Any,
+        body: Any,
+        rationale: Any = None,
+        source_urls: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Свой пост из веба в прогон. None — прогона нет; ValueError — невалидные данные.
+
+        Валидация и нормализация ссылок те же, что в update_article.
+        """
+        if self.get_run(run_id) is None:
+            return None
+        clean_title, clean_body = _clean_article_text(title, body)
+        urls = normalize_article_urls(source_urls)
+        cur = self._conn.execute(
+            "INSERT INTO articles (run_id, title, body, rationale, source_urls) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                run_id,
+                clean_title,
+                clean_body,
+                str(rationale or "").strip(),
+                json.dumps(urls, ensure_ascii=False),
+            ),
+        )
+        self._conn.commit()
+        return self.get_article(cur.lastrowid)
 
     def delete_article(self, article_id: int) -> bool:
         """Удаляет статью по id. False — статьи не было."""

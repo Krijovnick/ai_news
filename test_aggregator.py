@@ -1386,6 +1386,8 @@ class ArticleEditApiTests(unittest.TestCase):
         )
         with open(src_path, encoding="utf-8") as f:
             src = f.read()
+        self.assertIn("ArticleForm", src)
+        src += _read_frontend_src("components", "ArticleForm.vue")
         for text in ("Редактировать", "Сохранить", "Отмена", "Добавить ссылку", "Удалить пост"):
             self.assertIn(text, src)
         self.assertIn("is-busy", src)
@@ -1393,6 +1395,134 @@ class ArticleEditApiTests(unittest.TestCase):
         self.assertIn('method: "DELETE"', src)
         self.assertIn('method: "PUT"', src)
         self.assertNotIn("v-html", src)
+
+
+def _read_frontend_src(*parts):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "src", *parts)
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+class ArticleCreateApiTests(unittest.TestCase):
+    """Свой пост в прогон через JSON API, временная БД."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "test.db")
+        self.db = NewsDatabase(self.db_path)
+        import web as web_mod
+
+        self.web_mod = web_mod
+        self._orig_get_db = web_mod.get_db
+        web_mod.get_db = lambda: self.db
+        self.client = web_mod.app.test_client()
+        self.run_id = self.db.create_run(7)
+        self.db.save_articles(
+            self.run_id,
+            [{"title": "Сгенерированная", "body": "Текст", "source_urls": []}],
+        )
+
+    def tearDown(self):
+        self.web_mod.get_db = self._orig_get_db
+        self.db.close()
+        self._tmp.cleanup()
+
+    def _post(self, run_id, payload):
+        return self.client.post(
+            f"/api/runs/{run_id}/articles",
+            json=payload,
+            headers={"X-Requested-With": "fetch"},
+        )
+
+    def test_create_normalizes_urls_and_appears_in_run(self):
+        resp = self._post(
+            self.run_id,
+            {
+                "title": "  Мой пост ",
+                "body": " Мой текст\nвторая строка ",
+                "rationale": " Своё обоснование ",
+                "source_urls": [
+                    " https://a.example/1 ",
+                    "",
+                    "   ",
+                    "http://b.example/2",
+                    "https://a.example/1",
+                ],
+            },
+        )
+        self.assertIn(resp.status_code, (200, 201))
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        article = data["article"]
+        expected_urls = ["https://a.example/1", "http://b.example/2"]
+        self.assertEqual(article["title"], "Мой пост")
+        self.assertEqual(article["body"], "Мой текст\nвторая строка")
+        self.assertEqual(article["rationale"], "Своё обоснование")
+        self.assertEqual(article["source_urls"], expected_urls)
+        self.assertEqual(article["run_id"], self.run_id)
+
+        run_data = self.client.get(f"/api/runs/{self.run_id}").get_json()
+        titles = [a["title"] for a in run_data["articles"]]
+        self.assertEqual(titles, ["Сгенерированная", "Мой пост"])
+        self.assertEqual(run_data["articles"][-1]["source_urls"], expected_urls)
+
+        resp = self.client.put(
+            f"/api/articles/{article['id']}",
+            json={"title": "Правка", "body": "Т", "source_urls": []},
+            headers={"X-Requested-With": "fetch"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        resp = self.client.delete(
+            f"/api/articles/{article['id']}", headers={"X-Requested-With": "fetch"}
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_create_without_optional_fields(self):
+        resp = self._post(self.run_id, {"title": "Т", "body": "Б"})
+        self.assertIn(resp.status_code, (200, 201))
+        article = resp.get_json()["article"]
+        self.assertEqual(article["rationale"], "")
+        self.assertEqual(article["source_urls"], [])
+
+    def test_create_rejects_invalid_data(self):
+        cases = [
+            ({"title": "   ", "body": "Текст"}, "Заголовок"),
+            ({"title": "Заголовок", "body": "  "}, "Текст"),
+            (
+                {"title": "Заголовок", "body": "Текст", "source_urls": ["ftp://x.example/a"]},
+                "Некорректная ссылка",
+            ),
+            (
+                {"title": "Заголовок", "body": "Текст", "source_urls": ["example.com/page"]},
+                "Некорректная ссылка",
+            ),
+        ]
+        for payload, needle in cases:
+            resp = self._post(self.run_id, payload)
+            self.assertEqual(resp.status_code, 400, payload)
+            data = resp.get_json()
+            self.assertFalse(data["ok"])
+            self.assertIn(needle, data["error"])
+        resp = self.client.post(f"/api/runs/{self.run_id}/articles", data="not json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.get_json()["ok"])
+        self.assertEqual(len(self.db.get_articles_for_run(self.run_id)), 1)
+
+    def test_missing_run_returns_404(self):
+        resp = self._post(99999, {"title": "Т", "body": "Б"})
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.get_json(), {"ok": False, "error": "Прогон не найден"})
+        self.assertIsNone(self.db.create_article(99999, "Т", "Б"))
+
+    def test_run_view_has_add_post_without_v_html(self):
+        src = _read_frontend_src("views", "RunView.vue")
+        self.assertIn("Добавить пост", src)
+        self.assertIn("ArticleForm", src)
+        self.assertIn('method: "POST"', src)
+        self.assertIn("X-Requested-With", src)
+        self.assertIn("kw-toast", src)
+        self.assertNotIn("v-html", src)
+        self.assertNotIn("v-html", _read_frontend_src("components", "ArticleForm.vue"))
 
 
 def main():
