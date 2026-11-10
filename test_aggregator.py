@@ -1101,6 +1101,83 @@ class DeepSeekPromptsTests(unittest.TestCase):
         self.assertIn("RSS-ТЕКСТ", captured[1])
         self.assertEqual(articles[0]["source_urls"], ["https://a.example/1"])
 
+    def test_fetch_skipped_for_reddit_hosts(self):
+        from utils.deepseek import FETCH_URL, SEARCH_URL
+
+        reddit_urls = [
+            "https://reddit.com/r/x/comments/1/a",
+            "https://www.reddit.com/r/x/comments/2/b",
+            "https://old.reddit.com/r/x/comments/3/c",
+            "https://redd.it/abc",
+        ]
+        for url in reddit_urls:
+            with self.subTest(url=url):
+                client, captured = self._client_with_article_capture()
+                items = [{"title": "Пост", "url": url, "description": "ТЕКСТ-ПОСТА"}]
+                posted = []
+
+                def fake_post(post_url, headers=None, json=None, timeout=None):
+                    posted.append(post_url)
+                    if post_url == SEARCH_URL:
+                        return self._tool_response({"results": []})
+                    raise AssertionError(post_url)
+
+                with patch("utils.deepseek.requests.post", side_effect=fake_post):
+                    with self.assertNoLogs("utils.deepseek", level="WARNING"):
+                        articles, _ = client.build_articles_and_keywords(
+                            items, "разбор", web_tools=True
+                        )
+                self.assertNotIn(FETCH_URL, posted)
+                self.assertIn("ТЕКСТ-ПОСТА", captured[1])
+                self.assertEqual(articles[0]["source_urls"], [url])
+
+    def test_fetch_called_for_non_reddit_hosts(self):
+        from utils.deepseek import FETCH_URL, SEARCH_URL
+
+        for url in (
+            "https://a.example/1",
+            "https://notreddit.com/post",
+            "https://reddit.com.evil.org/r/x",
+        ):
+            with self.subTest(url=url):
+                client, captured = self._client_with_article_capture()
+                items = [{"title": "М", "url": url, "description": "RSS"}]
+                posted = []
+
+                def fake_post(post_url, headers=None, json=None, timeout=None):
+                    posted.append((post_url, json))
+                    if post_url == FETCH_URL:
+                        return self._tool_response({"content": "ПОЛНЫЙ-ТЕКСТ"})
+                    if post_url == SEARCH_URL:
+                        return self._tool_response({"results": []})
+                    raise AssertionError(post_url)
+
+                with patch("utils.deepseek.requests.post", side_effect=fake_post):
+                    client.build_articles_and_keywords(items, "разбор", web_tools=True)
+                self.assertIn((FETCH_URL, {"url": url}), posted)
+                self.assertIn("ПОЛНЫЙ-ТЕКСТ", captured[1])
+
+    def test_search_without_suitable_results_logs_info_not_warning(self):
+        from utils.deepseek import DeepSeekClient
+
+        client = DeepSeekClient(api_key="test-key")
+        payload = {
+            "results": [
+                {"rerank_score": 0.5, "url": "https://s.example/weak", "content": "x"},
+                {"rerank_score": 3.0, "url": "https://a.example/1", "content": "дубль"},
+            ]
+        }
+        with patch(
+            "utils.deepseek.requests.post", return_value=self._tool_response(payload)
+        ):
+            with self.assertNoLogs("utils.deepseek", level="WARNING"):
+                with self.assertLogs("utils.deepseek", level="INFO") as cm:
+                    results = client._search("q", {"https://a.example/1"})
+        self.assertEqual(results, [])
+        self.assertTrue(
+            any(m.startswith("INFO") and "нет подходящих результатов" in m for m in cm.output)
+        )
+
     def test_plan_parses_search_queries(self):
         from utils.deepseek import _parse_plan_payload
 

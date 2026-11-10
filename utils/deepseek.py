@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlsplit
 
 import requests
 import yaml
@@ -37,6 +38,9 @@ TOOLS_TIMEOUT = 60
 SEARCH_MIN_RERANK = 1.5
 SEARCH_QUERY_MAX_CHARS = 128
 MAX_SEARCH_QUERIES = 2
+# Fetch API DeepSeek не загружает Reddit (стабильно 404 на /v1/tools/fetch), а текст
+# поста уже есть из PRAW: для этих хостов и их поддоменов fetch не вызывается.
+FETCH_SKIP_HOSTS: Tuple[str, ...] = ("reddit.com", "redd.it")
 
 # Обязательные секции/ключи PROMPTS_PATH — без текстов инструкций (источник текстов — YAML).
 _REQUIRED_PROMPT_KEYS: Dict[str, Tuple[str, ...]] = {
@@ -460,7 +464,8 @@ class DeepSeekClient:
                 }
             )
         if not results:
-            logger.warning("Search DeepSeek: нет подходящих результатов для «%s»", query)
+            # Не сбой: поиск ответил, но всё отсеялось по rerank_score или дублям.
+            logger.info("Search DeepSeek: нет подходящих результатов для «%s»", query)
         return results
 
     def _collect_topic_texts(
@@ -475,13 +480,17 @@ class DeepSeekClient:
         for item in topic_items:
             url = str(item.get("url") or "").strip()
             rss_text = item.get("description") or item.get("text") or ""
+            need_fetch = use_web and bool(url)
+            if need_fetch and _skip_fetch(url):
+                logger.debug("Fetch DeepSeek пропущен для Reddit: %s", url)
+                need_fetch = False
             materials.append(
                 {
                     "title": item.get("title") or "",
                     "source": item.get("source") or "",
                     "url": url,
                     "text": rss_text[: Config.ARTICLE_ITEM_TEXT_CHARS],
-                    "full_text": self._fetch_text(url) if (use_web and url) else "",
+                    "full_text": self._fetch_text(url) if need_fetch else "",
                 }
             )
         extras: List[Dict[str, Any]] = []
@@ -490,6 +499,15 @@ class DeepSeekClient:
             for query in search_queries:
                 extras.extend(self._search(query, seen))
         return materials, extras
+
+
+def _skip_fetch(url: str) -> bool:
+    """URL на хосте из FETCH_SKIP_HOSTS или его поддомене (по распарсенному хосту)."""
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in FETCH_SKIP_HOSTS)
 
 
 def _retry_info(exc: requests.RequestException) -> Tuple[bool, Optional[float]]:
