@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -413,7 +414,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         client = DeepSeekClient(api_key="test-key")
         captured = []
 
-        def fake_chat(messages, temperature=0.7):
+        def fake_chat(messages, temperature=0.7, **_kwargs):
             captured.append(messages)
             return "разбор"
 
@@ -447,7 +448,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
             '],"keywords":["агентные права"]}'
         )
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             captured.append(messages[1]["content"])
             if len(captured) == 1:
                 return plan
@@ -494,7 +495,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         client = DeepSeekClient(api_key="test-key")
         calls = []
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             calls.append(1)
             if len(calls) == 1:
                 return self._TWO_TOPICS_PLAN
@@ -515,7 +516,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         client = DeepSeekClient(api_key="test-key")
         calls = []
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             calls.append(1)
             if len(calls) == 1:
                 return self._TWO_TOPICS_PLAN
@@ -547,6 +548,367 @@ class DeepSeekPromptsTests(unittest.TestCase):
         self.assertEqual(result, "обрезанный ответ")
         self.assertTrue(any("обрезан" in m and "8192" in m for m in cm.output))
 
+    # --- Повторы chat/completions при временных сбоях ---
+
+    @staticmethod
+    def _chat_response(content):
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {
+            "choices": [{"finish_reason": "stop", "message": {"content": content}}]
+        }
+        return resp
+
+    @staticmethod
+    def _http_error_response(status, headers=None):
+        resp = MagicMock()
+        resp.status_code = status
+        resp.headers = headers or {}
+        resp.raise_for_status.side_effect = requests.HTTPError(
+            f"{status} Client Error", response=resp
+        )
+        return resp
+
+    def _routed_post(self, plan, article_failures):
+        """requests.post: план — plan; статья по теме — сначала ошибки из article_failures[тема]."""
+        calls = []
+        failures = {k: list(v) for k, v in article_failures.items()}
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            user = json["messages"][1]["content"]
+            calls.append(user)
+            if "Материал 1" in user and "Материал 2" in user:
+                return self._chat_response(plan)
+            for topic, queue in failures.items():
+                if f"Материал {topic}" in user and queue:
+                    error = queue.pop(0)
+                    if isinstance(error, int):
+                        return self._http_error_response(error)
+                    raise error
+            title = "Статья 1" if "Материал 1" in user else "Статья 2"
+            return self._chat_response(f'{{"title":"{title}","body":"Текст","rationale":""}}')
+
+        return fake_post, calls
+
+    def test_article_retried_after_chunked_encoding_error(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        fake_post, calls = self._routed_post(
+            self._TWO_TOPICS_PLAN,
+            {2: [requests.exceptions.ChunkedEncodingError("Response ended prematurely")]},
+        )
+        with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
+            "utils.deepseek.time.sleep"
+        ) as sleep:
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual([a["title"] for a in articles], ["Статья 1", "Статья 2"])
+        self.assertEqual(len(calls), 4)
+        sleep.assert_called_once_with(5)
+        retry_logs = [m for m in cm.output if "WARNING" in m and "повтор" in m]
+        self.assertEqual(len(retry_logs), 1)
+        self.assertIn("Вторая", retry_logs[0])
+        self.assertIn("1 из 3", retry_logs[0])
+        self.assertIn("Response ended prematurely", retry_logs[0])
+        self.assertFalse(any("ERROR" in m for m in cm.output))
+
+    def test_article_402_not_retried(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        fake_post, calls = self._routed_post(self._TWO_TOPICS_PLAN, {1: [402]})
+        with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
+            "utils.deepseek.time.sleep"
+        ) as sleep:
+            with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual([a["title"] for a in articles], ["Статья 2"])
+        self.assertEqual(len(calls), 3)
+        sleep.assert_not_called()
+        self.assertTrue(any("Первая" in m and "не написана" in m for m in cm.output))
+
+    def test_chat_4xx_not_retried_429_and_5xx_retried(self):
+        from utils.deepseek import DeepSeekClient
+
+        client = DeepSeekClient(api_key="test-key")
+        for status in (400, 401, 402, 404):
+            with patch(
+                "utils.deepseek.requests.post",
+                return_value=self._http_error_response(status),
+            ) as post, patch("utils.deepseek.time.sleep") as sleep:
+                with self.assertRaises(requests.HTTPError):
+                    client._chat([{"role": "user", "content": "x"}])
+            self.assertEqual(post.call_count, 1, status)
+            sleep.assert_not_called()
+
+        for status in (429, 500, 502, 503):
+            with patch(
+                "utils.deepseek.requests.post",
+                side_effect=[self._http_error_response(status), self._chat_response("ок")],
+            ) as post, patch("utils.deepseek.time.sleep"):
+                with self.assertLogs("utils.deepseek", level="WARNING"):
+                    result = client._chat([{"role": "user", "content": "x"}])
+            self.assertEqual(result, "ок")
+            self.assertEqual(post.call_count, 2, status)
+
+        for error in (requests.ConnectionError("down"), requests.Timeout("slow")):
+            with patch(
+                "utils.deepseek.requests.post",
+                side_effect=[error, self._chat_response("ок")],
+            ) as post, patch("utils.deepseek.time.sleep"):
+                with self.assertLogs("utils.deepseek", level="WARNING"):
+                    result = client._chat([{"role": "user", "content": "x"}])
+            self.assertEqual(result, "ок")
+            self.assertEqual(post.call_count, 2)
+
+    def test_chat_429_respects_retry_after_with_cap(self):
+        from utils.deepseek import CHAT_RETRY_AFTER_MAX, DeepSeekClient
+
+        client = DeepSeekClient(api_key="test-key")
+        for header, expected in (("30", 30), ("1", 5), ("100000", CHAT_RETRY_AFTER_MAX)):
+            with patch(
+                "utils.deepseek.requests.post",
+                side_effect=[
+                    self._http_error_response(429, {"Retry-After": header}),
+                    self._chat_response("ок"),
+                ],
+            ), patch("utils.deepseek.time.sleep") as sleep:
+                with self.assertLogs("utils.deepseek", level="WARNING"):
+                    client._chat([{"role": "user", "content": "x"}])
+            sleep.assert_called_once_with(expected)
+
+    def test_unparsed_model_answer_not_retried(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return self._chat_response(self._TWO_TOPICS_PLAN)
+            if len(calls) == 2:
+                return self._chat_response("не JSON")
+            return self._chat_response('{"title":"Статья 2","body":"Текст","rationale":""}')
+
+        with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
+            "utils.deepseek.time.sleep"
+        ) as sleep:
+            with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(len(calls), 3)
+        sleep.assert_not_called()
+        self.assertEqual([a["title"] for a in articles], ["Статья 2"])
+        self.assertTrue(any("не разобран" in m for m in cm.output))
+
+    def test_article_skipped_after_retries_exhausted(self):
+        from utils.deepseek import CHAT_RETRY_DELAYS, DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        attempts = len(CHAT_RETRY_DELAYS) + 1
+        fake_post, calls = self._routed_post(
+            self._TWO_TOPICS_PLAN,
+            {1: [requests.exceptions.ChunkedEncodingError("Response ended prematurely")] * attempts},
+        )
+        with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
+            "utils.deepseek.time.sleep"
+        ) as sleep:
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual([a["title"] for a in articles], ["Статья 2"])
+        # план + все попытки первой статьи + вторая статья
+        self.assertEqual(len(calls), 1 + attempts + 1)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], list(CHAT_RETRY_DELAYS))
+        self.assertEqual(
+            len([m for m in cm.output if "WARNING" in m and "повтор" in m]),
+            len(CHAT_RETRY_DELAYS),
+        )
+        self.assertTrue(
+            any("ERROR" in m and "Первая" in m and "не написана" in m for m in cm.output)
+        )
+
+    def test_plan_retried_after_connection_drop(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        responses = [
+            requests.exceptions.ChunkedEncodingError("Response ended prematurely"),
+            self._chat_response(self._TWO_TOPICS_PLAN),
+            self._chat_response('{"title":"Статья 1","body":"Текст","rationale":""}'),
+            self._chat_response('{"title":"Статья 2","body":"Текст","rationale":""}'),
+        ]
+        with patch("utils.deepseek.requests.post", side_effect=responses) as post, patch(
+            "utils.deepseek.time.sleep"
+        ):
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(post.call_count, 4)
+        self.assertEqual(len(articles), 2)
+        self.assertTrue(any("план статей" in m and "повтор" in m for m in cm.output))
+
+    def test_plan_error_raised_after_retries_exhausted(self):
+        from utils.deepseek import CHAT_RETRY_DELAYS, DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        attempts = len(CHAT_RETRY_DELAYS) + 1
+        with patch(
+            "utils.deepseek.requests.post",
+            side_effect=requests.ConnectionError("down"),
+        ) as post, patch("utils.deepseek.time.sleep"):
+            with self.assertLogs("utils.deepseek", level="WARNING"):
+                with self.assertRaises(requests.ConnectionError):
+                    client.build_articles_and_keywords(
+                        self._TWO_ITEMS, "разбор", web_tools=False
+                    )
+        self.assertEqual(post.call_count, attempts)
+
+    def test_ssl_and_proxy_errors_not_retried(self):
+        from utils.deepseek import DeepSeekClient
+
+        client = DeepSeekClient(api_key="test-key")
+        for error in (
+            requests.exceptions.SSLError("certificate verify failed"),
+            requests.exceptions.ProxyError("Cannot connect to proxy"),
+        ):
+            # Оба наследуют ConnectionError, но не повторяются.
+            self.assertIsInstance(error, requests.ConnectionError)
+            with patch(
+                "utils.deepseek.requests.post",
+                side_effect=[error, self._chat_response("ок")],
+            ) as post, patch("utils.deepseek.time.sleep") as sleep:
+                with self.assertRaises(type(error)):
+                    client._chat([{"role": "user", "content": "x"}])
+            self.assertEqual(post.call_count, 1, type(error).__name__)
+            sleep.assert_not_called()
+
+    def test_chat_429_retry_after_http_date(self):
+        from utils.deepseek import CHAT_RETRY_AFTER_MAX, DeepSeekClient
+
+        client = DeepSeekClient(api_key="test-key")
+        now = datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+        cases = (
+            ("Tue, 10 Nov 2026 12:00:30 GMT", 30),  # 30 с вперёд
+            ("Tue, 10 Nov 2026 12:00:02 GMT", 5),  # меньше своей паузы — своя
+            ("Tue, 10 Nov 2026 13:00:00 GMT", CHAT_RETRY_AFTER_MAX),  # потолок
+            ("Tue, 10 Nov 2026 11:59:00 GMT", 5),  # прошедшая дата — своя
+            ("не дата", 5),  # некорректная — своя
+            ("Tue, 99 Foo 2026 12:00:00 GMT", 5),
+        )
+        for header, expected in cases:
+            with self.subTest(header=header), patch(
+                "utils.deepseek._utc_now", return_value=now
+            ), patch(
+                "utils.deepseek.requests.post",
+                side_effect=[
+                    self._http_error_response(429, {"Retry-After": header}),
+                    self._chat_response("ок"),
+                ],
+            ), patch("utils.deepseek.time.sleep") as sleep:
+                with self.assertLogs("utils.deepseek", level="WARNING"):
+                    self.assertEqual(client._chat([{"role": "user", "content": "x"}]), "ок")
+                sleep.assert_called_once_with(expected)
+
+    @staticmethod
+    def _non_json_response():
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.json.side_effect = requests.JSONDecodeError("Expecting value", "<html>", 0)
+        return resp
+
+    def test_non_json_api_body_article_skipped_without_retry(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            user = json["messages"][1]["content"]
+            calls.append(user)
+            if "Материал 1" in user and "Материал 2" in user:
+                return self._chat_response(self._TWO_TOPICS_PLAN)
+            if "Материал 1" in user:
+                return self._non_json_response()
+            return self._chat_response('{"title":"Статья 2","body":"Текст","rationale":""}')
+
+        with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
+            "utils.deepseek.time.sleep"
+        ) as sleep:
+            with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(len(calls), 3)  # план + по одному запросу на статью
+        sleep.assert_not_called()
+        self.assertEqual([a["title"] for a in articles], ["Статья 2"])
+        self.assertTrue(
+            any("ERROR" in m and "Первая" in m and "не написана" in m for m in cm.output)
+        )
+
+    def test_non_json_api_body_plan_raises_without_retry(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        with patch(
+            "utils.deepseek.requests.post", return_value=self._non_json_response()
+        ) as post, patch("utils.deepseek.time.sleep") as sleep:
+            with self.assertRaises(requests.JSONDecodeError):
+                client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_weekly_analysis_retried_after_connection_drop(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        with patch(
+            "utils.deepseek.requests.post",
+            side_effect=[
+                requests.exceptions.ChunkedEncodingError("Response ended prematurely"),
+                self._chat_response("разбор"),
+            ],
+        ) as post, patch("utils.deepseek.time.sleep"):
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                result = client.build_weekly_analysis(self._TWO_ITEMS)
+        self.assertEqual(result, "разбор")
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(any("разбор недели" in m and "повтор" in m for m in cm.output))
+
+    def test_weekly_analysis_error_raised_after_retries_exhausted(self):
+        from utils.deepseek import CHAT_RETRY_DELAYS, DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        with patch(
+            "utils.deepseek.requests.post",
+            return_value=self._http_error_response(503),
+        ) as post, patch("utils.deepseek.time.sleep"):
+            with self.assertLogs("utils.deepseek", level="WARNING"):
+                with self.assertRaises(requests.HTTPError):
+                    client.build_weekly_analysis(self._TWO_ITEMS)
+        self.assertEqual(post.call_count, len(CHAT_RETRY_DELAYS) + 1)
+
     def test_empty_plan_gives_no_articles(self):
         from utils.deepseek import DeepSeekClient, clear_prompts_cache
 
@@ -554,7 +916,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         client = DeepSeekClient(api_key="test-key")
         calls = []
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             calls.append(1)
             return '{"topics":[],"keywords":[]}'
 
@@ -579,7 +941,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         client = DeepSeekClient(api_key="test-key")
         captured = []
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             captured.append(messages[1]["content"])
             return '{"topics":[],"keywords":[]}'
 
@@ -614,7 +976,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         )
         captured = []
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             captured.append(messages[1]["content"])
             if len(captured) == 1:
                 return plan
@@ -656,7 +1018,7 @@ class DeepSeekPromptsTests(unittest.TestCase):
         client = DeepSeekClient(api_key="test-key")
         captured = []
 
-        def fake_chat(messages, temperature=0.7, max_tokens=None):
+        def fake_chat(messages, temperature=0.7, max_tokens=None, **_kwargs):
             captured.append(messages[1]["content"])
             if len(captured) == 1:
                 return self._SEARCH_PLAN
@@ -1187,7 +1549,7 @@ class ManualRunTests(unittest.TestCase):
         self.assertEqual(len(manual), 1)
         self.assertEqual(manual[0]["title"], item["title"])
 
-    def test_deepseek_failure_marks_failed_and_skips_telegram(self):
+    def test_deepseek_failure_removes_run_and_skips_telegram(self):
         fake = self._fake_deepseek()
         fake.build_weekly_analysis.side_effect = RuntimeError("модель недоступна")
         with patch("main.DeepSeekClient", return_value=fake), patch(
@@ -1209,10 +1571,336 @@ class ManualRunTests(unittest.TestCase):
         data = resp.get_json()
         self.assertFalse(data["ok"])
         self.assertIn("модель недоступна", data["error"])
-        runs = self.db.list_runs()
-        self.assertEqual(len(runs), 1)
-        self.assertEqual(runs[0]["status"], "failed")
+        self.assertEqual(self.db.list_runs(), [])
+        row = self.db._conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()
+        self.assertEqual(row["c"], 0)
+        row = self.db._conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()
+        self.assertEqual(row["c"], 0)
         tg.return_value.send_message.assert_not_called()
+
+    def test_value_error_inside_run_is_500_not_400(self):
+        # ValueError из самого прогона (например, разбор ответа DeepSeek) — это
+        # ошибка прогона, а не ввода: 500, прогон удалён, Telegram не вызван.
+        fake = self._fake_deepseek()
+        fake.build_articles_and_keywords.side_effect = ValueError("ответ плана не разобран")
+        with patch("main.DeepSeekClient", return_value=fake), patch(
+            "main.TelegramSender"
+        ) as tg:
+            resp = self.client.post(
+                "/api/manual-run",
+                json={"items": [{"title": "Заметка про агентов", "text": "Текст"}]},
+            )
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        self.assertFalse(data["ok"])
+        self.assertIn("ответ плана не разобран", data["error"])
+        fake.build_weekly_analysis.assert_called_once()
+        for table in ("runs", "items", "summaries", "articles"):
+            row = self.db._conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+            self.assertEqual(row["c"], 0, table)
+        tg.return_value.send_message.assert_not_called()
+
+    def test_config_error_is_500_without_run(self):
+        # Ошибка конфигурации — не ошибка ввода: 500, прогон не создаётся.
+        self.validate_mock.side_effect = ValueError("Ошибки конфигурации:\nDEEPSEEK_API_KEY не установлен")
+        with patch("main.DeepSeekClient") as ds, patch("main.TelegramSender") as tg:
+            resp = self.client.post(
+                "/api/manual-run",
+                json={"items": [{"title": "Заметка про агентов", "text": "Текст"}]},
+            )
+            ds.assert_not_called()
+            tg.return_value.send_message.assert_not_called()
+        self.assertEqual(resp.status_code, 500)
+        self.assertIn("DEEPSEEK_API_KEY", resp.get_json()["error"])
+        self.assertEqual(self.db.list_runs(), [])
+
+    def test_manual_input_error_is_not_value_error(self):
+        from main import ManualInputError
+
+        self.assertFalse(issubclass(ManualInputError, ValueError))
+
+    def test_failure_after_saving_removes_run_and_linked_rows(self):
+        fake = self._fake_deepseek()
+        with patch("main.DeepSeekClient", return_value=fake), patch(
+            "main.TelegramSender"
+        ) as tg, patch.object(
+            self.db, "finish_run", side_effect=RuntimeError("402 Payment Required")
+        ):
+            resp = self.client.post(
+                "/api/manual-run",
+                json={"items": [{"title": "Заметка про агентов", "text": "Текст"}]},
+            )
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        self.assertFalse(data["ok"])
+        self.assertIn("402 Payment Required", data["error"])
+        for table in ("runs", "items", "summaries", "articles"):
+            row = self.db._conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+            self.assertEqual(row["c"], 0, table)
+        proposed = {r["phrase"] for r in self.db.get_keywords("proposed")}
+        self.assertNotIn("новая фраза ручного прогона", proposed)
+        tg.return_value.send_message.assert_not_called()
+
+
+class FailedRunCleanupTests(unittest.TestCase):
+    """Упавшие прогоны не хранятся и не видны в вебе; running не трогаем."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "test.db")
+        self.db = NewsDatabase(self.db_path)
+
+    def tearDown(self):
+        self.db.close()
+        self._tmp.cleanup()
+
+    def _count(self, db, table, run_id):
+        return db._conn.execute(
+            f"SELECT COUNT(*) AS c FROM {table} WHERE run_id = ?", (run_id,)
+        ).fetchone()["c"]
+
+    def _fill_run(self, run_id):
+        self.db.save_items(
+            run_id,
+            [{"title": "AI agents", "url": "https://e.example/a", "source": "t"}],
+        )
+        self.db.save_summary(run_id, "разбор")
+        self.db.save_articles(run_id, [{"title": "Статья", "body": "Текст"}])
+        self.db.propose_keywords([f"proposed of run {run_id}"], run_id)
+
+    def test_full_run_failure_leaves_no_rows(self):
+        from main import AINewsAggregator
+
+        agg = AINewsAggregator(db=self.db)
+        agg.config.validate_config = MagicMock()
+        agg.logger = MagicMock()
+        agg.telegram_sender = MagicMock()
+        item = {
+            "title": "AI automation case",
+            "url": "https://example.com/case",
+            "source": "test",
+            "description": "practice",
+        }
+        agg.collect_news = MagicMock(return_value=([item], []))
+        agg.process_news = MagicMock(return_value=[item])
+        fake = MagicMock()
+        fake.build_weekly_analysis.return_value = "Разбор"
+        fake.build_articles_and_keywords.return_value = (
+            [{"title": "Статья", "body": "Текст"}],
+            ["phrase from failed full run"],
+        )
+        with patch("main.DeepSeekClient", return_value=fake), patch.object(
+            self.db, "finish_run", side_effect=RuntimeError("402 Payment Required")
+        ):
+            agg.run()
+
+        for table in ("runs", "items", "summaries", "articles"):
+            row = self.db._conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()
+            self.assertEqual(row["c"], 0, table)
+        phrases = {r["phrase"] for r in self.db.get_keywords()}
+        self.assertNotIn("phrase from failed full run", phrases)
+        agg.telegram_sender.send_message.assert_not_called()
+        logged = " ".join(str(c) for c in agg.logger.error.call_args_list)
+        self.assertIn("402 Payment Required", logged)
+
+    def test_web_hides_failed_run(self):
+        import web as web_mod
+
+        ok_id = self.db.create_run(7)
+        self.db.finish_run(ok_id, status="ok")
+        failed_id = self.db.create_run(7)
+        self.db.finish_run(failed_id, status="failed", error_text="402")
+
+        orig = web_mod.get_db
+        web_mod.get_db = lambda: self.db
+        try:
+            client = web_mod.app.test_client()
+            weeks = client.get("/api/weeks").get_json()
+            ids = [r["id"] for w in weeks["weeks"] for r in w["runs"]]
+            self.assertEqual(ids, [ok_id])
+            self.assertEqual(client.get(f"/api/runs/{failed_id}").status_code, 404)
+            self.assertEqual(client.get(f"/api/runs/{ok_id}").status_code, 200)
+            resp = client.post(
+                f"/api/runs/{failed_id}/articles", json={"title": "T", "body": "B"}
+            )
+            self.assertEqual(resp.status_code, 404)
+        finally:
+            web_mod.get_db = orig
+
+    def test_open_db_survives_failed_cleanup_error(self):
+        self.db.close()
+        with patch.object(
+            NewsDatabase,
+            "delete_failed_runs",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertLogs("utils.db", level="WARNING") as cm:
+                db = NewsDatabase(self.db_path)
+        try:
+            self.assertTrue(any("WARNING" in m and "database is locked" in m for m in cm.output))
+            # База открыта и работает: стартовые ключи на месте, прогон создаётся.
+            self.assertTrue(db.get_active_keywords())
+            run_id = db.create_run(7)
+            self.assertIsInstance(run_id, int)
+        finally:
+            db.close()
+        self.db = NewsDatabase(self.db_path)
+
+    def test_open_db_removes_old_failed_runs_keeps_running_and_ok(self):
+        failed_id = self.db.create_run(7)
+        self._fill_run(failed_id)
+        self.db.finish_run(failed_id, status="failed", error_text="402 Payment Required")
+        running_id = self.db.create_run(7)
+        self._fill_run(running_id)
+        ok_id = self.db.create_run(7)
+        self._fill_run(ok_id)
+        self.db.finish_run(ok_id, status="ok")
+
+        active_kid = self.db.add_keyword("active linked to failed", "active", run_id=failed_id)
+        rejected_kid = self.db.add_keyword("rejected linked to failed", "rejected", run_id=failed_id)
+
+        reopened = NewsDatabase(self.db_path)
+        try:
+            raw = reopened._conn.execute(
+                "SELECT id FROM runs ORDER BY id"
+            ).fetchall()
+            self.assertEqual([r["id"] for r in raw], [running_id, ok_id])
+            for table in ("items", "summaries", "articles"):
+                self.assertEqual(self._count(reopened, table, failed_id), 0, table)
+                self.assertEqual(self._count(reopened, table, running_id), 1, table)
+                self.assertEqual(self._count(reopened, table, ok_id), 1, table)
+            kws = {r["id"]: r for r in reopened.get_keywords()}
+            phrases = {r["phrase"] for r in kws.values()}
+            self.assertNotIn(f"proposed of run {failed_id}", phrases)
+            self.assertIn(f"proposed of run {running_id}", phrases)
+            self.assertIn(f"proposed of run {ok_id}", phrases)
+            self.assertEqual(kws[active_kid]["status"], "active")
+            self.assertIsNone(kws[active_kid]["run_id"])
+            self.assertEqual(kws[rejected_kid]["status"], "rejected")
+            self.assertIsNone(kws[rejected_kid]["run_id"])
+            self.assertEqual(reopened.get_run(running_id)["status"], "running")
+        finally:
+            reopened.close()
+
+    def _swap_conn_failing_on(self, sql_prefix):
+        """Подменяет соединение: execute с указанным SQL падает, остальное — как есть."""
+        real = self.db._conn
+
+        class FailingConn:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def execute(self, sql, *args):
+                if sql.strip().startswith(sql_prefix):
+                    raise sqlite3.OperationalError("disk I/O error")
+                return real.execute(sql, *args)
+
+        self.db._conn = FailingConn()
+        return real
+
+    def test_delete_run_rolls_back_on_error(self):
+        run_id = self.db.create_run(7)
+        self._fill_run(run_id)
+        real = self._swap_conn_failing_on("DELETE FROM runs")
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                self.db.delete_run(run_id)
+        finally:
+            self.db._conn = real
+        self.assertTrue(real.in_transaction is False)
+        for table in ("items", "summaries", "articles"):
+            self.assertEqual(self._count(self.db, table, run_id), 1, table)
+        phrases = {r["phrase"] for r in self.db.get_keywords()}
+        self.assertIn(f"proposed of run {run_id}", phrases)
+        self.assertIsNotNone(self.db.get_run(run_id))
+
+    def test_cleanup_failure_marks_run_failed_and_reraises(self):
+        from main import AINewsAggregator
+
+        agg = AINewsAggregator(db=self.db)
+        agg.logger = MagicMock()
+        agg.telegram_sender = MagicMock()
+        item = {
+            "title": "AI automation case",
+            "url": "https://example.com/case",
+            "source": "test",
+            "description": "practice",
+        }
+        fake = MagicMock()
+        fake.build_weekly_analysis.side_effect = RuntimeError("402 Payment Required")
+        with patch("main.DeepSeekClient", return_value=fake), patch.object(
+            self.db, "delete_run", side_effect=sqlite3.OperationalError("locked")
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                agg.complete_run([item], "")
+        self.assertIn("402", str(ctx.exception))
+        rows = self.db._conn.execute("SELECT id, status FROM runs").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "failed")
+        run_id = rows[0]["id"]
+        self.assertIsNone(self.db.get_run(run_id))
+        self.assertEqual(self.db.list_runs(), [])
+        agg.telegram_sender.send_message.assert_not_called()
+
+        reopened = NewsDatabase(self.db_path)
+        try:
+            raw = reopened._conn.execute("SELECT COUNT(*) AS c FROM runs").fetchone()
+            self.assertEqual(raw["c"], 0)
+            self.assertEqual(self._count(reopened, "items", run_id), 0)
+        finally:
+            reopened.close()
+
+    def test_mark_telegram_sent_error_keeps_ok_run(self):
+        from main import AINewsAggregator
+
+        agg = AINewsAggregator(db=self.db)
+        agg.logger = MagicMock()
+        tg = MagicMock()
+        tg.send_message.return_value = True
+        agg._telegram = MagicMock(return_value=tg)
+        item = {
+            "title": "AI automation case",
+            "url": "https://example.com/case",
+            "source": "test",
+            "description": "practice",
+        }
+        fake = MagicMock()
+        fake.build_weekly_analysis.return_value = "Разбор"
+        fake.build_articles_and_keywords.return_value = (
+            [{"title": "Статья", "body": "Текст"}],
+            [],
+        )
+        with patch("main.DeepSeekClient", return_value=fake), patch.object(
+            self.db, "mark_telegram_sent", side_effect=sqlite3.OperationalError("locked")
+        ):
+            run_id = agg.complete_run([item], "")
+
+        tg.send_message.assert_called_once()
+        run = self.db.get_run(run_id)
+        self.assertIsNotNone(run)
+        self.assertEqual(run["status"], "ok")
+        self.assertEqual(self._count(self.db, "items", run_id), 1)
+        self.assertEqual(self._count(self.db, "articles", run_id), 1)
+        logged = " ".join(str(c) for c in agg.logger.error.call_args_list)
+        self.assertIn("locked", logged)
+
+    def test_delete_runs_without_items_uses_cascade(self):
+        empty_id = self.db.create_run(7)
+        self.db.save_summary(empty_id, "разбор")
+        self.db.propose_keywords([f"proposed of empty {empty_id}"], empty_id)
+        active_kid = self.db.add_keyword("active of empty", "active", run_id=empty_id)
+        kept_id = self.db.create_run(7)
+        self._fill_run(kept_id)
+
+        self.assertEqual(self.db.delete_runs_without_items(), [empty_id])
+        kws = {r["id"]: r for r in self.db.get_keywords()}
+        phrases = {r["phrase"] for r in kws.values()}
+        self.assertNotIn(f"proposed of empty {empty_id}", phrases)
+        self.assertIn(f"proposed of run {kept_id}", phrases)
+        self.assertEqual(kws[active_kid]["status"], "active")
+        self.assertIsNone(kws[active_kid]["run_id"])
+        self.assertIsNone(self.db.get_summary(empty_id))
+        self.assertIsNotNone(self.db.get_run(kept_id))
 
     def test_manual_panel_source_has_no_v_html(self):
         src_path = os.path.join(

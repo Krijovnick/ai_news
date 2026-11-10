@@ -30,6 +30,14 @@ MANUAL_SOURCE = "Вручную"
 MANUAL_TITLE_LANGUAGE_ERROR = "Заголовок должен быть на русском или английском"
 
 
+class ManualInputError(Exception):
+    """Невалидный ввод «Свои тексты»: прогон не создаётся, веб отвечает 400.
+
+    Отдельный тип, а не ValueError: ValueError из самого прогона (разбор ответа
+    DeepSeek, конфигурация) — ошибка прогона, а не ввода.
+    """
+
+
 class AINewsAggregator:
     def __init__(self, db: Optional[NewsDatabase] = None):
         self.config = Config()
@@ -157,8 +165,9 @@ class AINewsAggregator:
         """DeepSeek, запись в SQLite и одно уведомление в Telegram.
 
         Вызывается и обычным прогоном, и разбором своих текстов.
-        Если ошибка после создания прогона — статус failed, исключение пробрасывается.
-        В Telegram ошибку не отправляем.
+        Если ошибка после создания прогона — прогон и всё, что к нему привязано,
+        удаляются из базы (в вебе его нет), исключение пробрасывается и пишется в лог
+        вызывающим. В Telegram ошибку не отправляем.
         """
         run_id: Optional[int] = None
         try:
@@ -179,13 +188,41 @@ class AINewsAggregator:
             self.logger.info("Статей: %s, новых proposed-ключей: %s", len(articles), added)
 
             self.db.finish_run(run_id, status="ok", error_text=protocol_text)
-            self._send_success_notification(run_id)
-            self.logger.info("Прогон завершён успешно")
-            return run_id
-        except Exception as e:
+        except Exception:
             if run_id is not None:
-                self.db.finish_run(run_id, status="failed", error_text=str(e))
+                self._discard_failed_run(run_id)
             raise
+
+        # Прогон уже ok: ошибка уведомления или отметки telegram_sent его не удаляет.
+        try:
+            self._send_success_notification(run_id)
+        except Exception as notify_error:
+            self.logger.error(
+                "Ошибка уведомления об успешном прогоне %s: %s", run_id, notify_error
+            )
+        self.logger.info("Прогон завершён успешно")
+        return run_id
+
+    def _discard_failed_run(self, run_id: int) -> None:
+        """Удаляет упавший прогон каскадом. Если не вышло — помечает failed.
+
+        failed не видны в вебе и доудаляются delete_failed_runs при следующем
+        открытии базы. Ошибки здесь только логируются.
+        """
+        try:
+            self.db.delete_run(run_id)
+            self.logger.info("Прогон %s завершился ошибкой и удалён из базы", run_id)
+            return
+        except Exception as cleanup_error:
+            self.logger.error(
+                "Не удалось удалить упавший прогон %s: %s", run_id, cleanup_error
+            )
+        try:
+            self.db.finish_run(run_id, status="failed")
+        except Exception as mark_error:
+            self.logger.error(
+                "Не удалось пометить упавший прогон %s как failed: %s", run_id, mark_error
+            )
 
     def run(self) -> None:
         try:
@@ -211,7 +248,7 @@ class AINewsAggregator:
 
         except Exception as e:
             self.logger.error("Критическая ошибка прогона: %s", e)
-            # В Telegram ошибку не отправляем. Статус failed ставит complete_run.
+            # В Telegram ошибку не отправляем. Упавший прогон удаляет complete_run.
 
     def run_manual(self, items: List[Dict[str, Any]]) -> int:
         """Разбор уже отобранных текстов без сбора источников. Возвращает run_id."""
@@ -223,7 +260,7 @@ class AINewsAggregator:
                 "Пустой ручной прогон: после фильтров нет материалов. "
                 "В SQLite и Telegram ничего не пишем."
             )
-            raise ValueError(MANUAL_TITLE_LANGUAGE_ERROR)
+            raise ManualInputError(MANUAL_TITLE_LANGUAGE_ERROR)
         return self.complete_run(processed, "")
 
     def _send_success_notification(self, run_id: int) -> None:

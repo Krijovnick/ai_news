@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
@@ -19,6 +22,13 @@ CHUNK_SIZE = 25
 # И плану, и статье даём максимум вывода deepseek-chat.
 PLAN_MAX_TOKENS = 8192
 ARTICLE_MAX_TOKENS = 8192
+CHAT_TIMEOUT = 300
+
+# Повторы chat/completions при временных сбоях (обрыв, соединение, таймаут, 429, 5xx):
+# по одной паузе на повтор, т.е. 2 повтора после первой попытки.
+CHAT_RETRY_DELAYS: Tuple[float, ...] = (5, 15)
+# Потолок паузы из Retry-After для 429 (секунды или HTTP-date), секунды.
+CHAT_RETRY_AFTER_MAX = 60
 
 # Search/Fetch API DeepSeek: полные тексты и дополнительные источники для статьи.
 FETCH_URL = "https://api.deepseek.com/v1/tools/fetch"
@@ -170,6 +180,7 @@ class DeepSeekClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        step: str = "запрос DeepSeek",
     ) -> str:
         payload: Dict[str, Any] = {
             "model": self.model,
@@ -178,16 +189,7 @@ class DeepSeekClient:
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
-        response = requests.post(
-            API_URL,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=300,
-        )
-        response.raise_for_status()
+        response = self._post_chat_with_retry(payload, step)
         data = response.json()
         choice = data["choices"][0]
         if choice.get("finish_reason") == "length":
@@ -196,6 +198,45 @@ class DeepSeekClient:
             )
         # content может прийти null — отдаём пустую строку, разбор решит дальше.
         return (choice["message"].get("content") or "").strip()
+
+    def _post_chat_with_retry(self, payload: Dict[str, Any], step: str) -> requests.Response:
+        """POST chat/completions с повтором временных сбоев; прочие ошибки — сразу наверх.
+
+        Повторяются обрыв ответа, ошибка соединения, таймаут, HTTP 429 и 5xx.
+        Остальные 4xx (400, 401, 402 …), SSLError и ProxyError не повторяются. После исчерпания попыток
+        пробрасывается последняя ошибка.
+        """
+        attempts = len(CHAT_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.post(
+                    API_URL,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=CHAT_TIMEOUT,
+                )
+                response.raise_for_status()
+                return response
+            except requests.RequestException as exc:
+                retryable, retry_after = _retry_info(exc)
+                if not retryable or attempt >= attempts:
+                    raise
+                delay = CHAT_RETRY_DELAYS[attempt - 1]
+                if retry_after is not None:
+                    delay = max(delay, min(retry_after, CHAT_RETRY_AFTER_MAX))
+                logger.warning(
+                    "DeepSeek, %s: попытка %s из %s не удалась (%s), повтор через %s с",
+                    step,
+                    attempt,
+                    attempts,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+        raise RuntimeError("недостижимо")  # pragma: no cover
 
     def _chunk_items(self, items: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         items = list(items)
@@ -219,7 +260,8 @@ class DeepSeekClient:
                 [
                     {"role": "system", "content": prompts["system_single"]},
                     {"role": "user", "content": prompt},
-                ]
+                ],
+                step="разбор недели",
             )
 
         partials = []
@@ -236,7 +278,8 @@ class DeepSeekClient:
                     [
                         {"role": "system", "content": prompts["system_partial"]},
                         {"role": "user", "content": prompt},
-                    ]
+                    ],
+                    step=f"разбор недели, часть {idx} из {total}",
                 )
             )
 
@@ -249,7 +292,8 @@ class DeepSeekClient:
             [
                 {"role": "system", "content": prompts["system_merge"]},
                 {"role": "user", "content": merge_prompt},
-            ]
+            ],
+            step="склейка разбора недели",
         )
 
     def build_articles_and_keywords(
@@ -277,7 +321,7 @@ class DeepSeekClient:
             summary=summary,
             materials=format_titles_for_plan(items),
         )
-        # Ошибка запроса плана пробрасывается: без плана статей нет.
+        # Ошибка запроса плана (после повторов в _chat) пробрасывается: без плана статей нет.
         raw_plan = self._chat(
             [
                 {"role": "system", "content": prompts["plan_system"]},
@@ -285,6 +329,7 @@ class DeepSeekClient:
             ],
             temperature=0.3,
             max_tokens=PLAN_MAX_TOKENS,
+            step="план статей",
         )
         topics, keywords = _parse_plan_payload(raw_plan, item_count=len(items))
         if limit > 0:
@@ -314,8 +359,10 @@ class DeepSeekClient:
                     ],
                     temperature=0.8,
                     max_tokens=ARTICLE_MAX_TOKENS,
+                    step=f"статья «{topic['topic']}»",
                 )
-            # Сеть, HTTP-ошибка или битая структура ответа — пропускаем только эту статью.
+            # Сеть/HTTP-ошибка (после повторов в _chat) или битая структура ответа —
+            # пропускаем только эту статью.
             except (
                 requests.RequestException,
                 KeyError,
@@ -443,6 +490,56 @@ class DeepSeekClient:
             for query in search_queries:
                 extras.extend(self._search(query, seen))
         return materials, extras
+
+
+def _retry_info(exc: requests.RequestException) -> Tuple[bool, Optional[float]]:
+    """Временный ли сбой chat/completions и пауза из Retry-After (для 429), если есть."""
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        status = getattr(response, "status_code", None)
+        if status == 429:
+            return True, _parse_retry_after(response)
+        return isinstance(status, int) and 500 <= status < 600, None
+    # SSLError и ProxyError наследуют ConnectionError, но это ошибки настройки
+    # (сертификаты, адрес/доступ прокси): за 20 с паузы не исправятся. Проверка раньше.
+    if isinstance(exc, (requests.exceptions.SSLError, requests.exceptions.ProxyError)):
+        return False, None
+    # ChunkedEncodingError — обрыв посреди ответа; ConnectionError и Timeout — сеть.
+    if isinstance(
+        exc,
+        (requests.exceptions.ChunkedEncodingError, requests.ConnectionError, requests.Timeout),
+    ):
+        return True, None
+    return False, None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_retry_after(response: Any) -> Optional[float]:
+    """Retry-After в секундах или HTTP-date; None — нет, некорректно или в прошлом."""
+    try:
+        raw = response.headers.get("Retry-After")
+    except AttributeError:
+        return None
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    try:
+        value = float(text)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        value = (when - _utc_now()).total_seconds()
+        return value if value > 0 else None
+    return value if value >= 0 else None
 
 
 def format_titles_for_plan(items: Sequence[Dict[str, Any]]) -> str:

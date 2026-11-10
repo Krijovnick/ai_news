@@ -12,7 +12,12 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from flask import Flask, jsonify, redirect, request, send_from_directory, url_for
 
-from main import MANUAL_TITLE_LANGUAGE_ERROR, AINewsAggregator, normalize_manual_pairs
+from main import (
+    MANUAL_TITLE_LANGUAGE_ERROR,
+    AINewsAggregator,
+    ManualInputError,
+    normalize_manual_pairs,
+)
 from utils.config import Config, setup_logging
 from utils.db import NewsDatabase, group_runs_by_iso_week
 
@@ -239,7 +244,9 @@ def api_manual_run():
     aggregator = AINewsAggregator(db=get_db())
     try:
         run_id = aggregator.run_manual(prepared)
-    except ValueError as e:
+    # 400 — только невалидный ввод (прогон не создан). Любая другая ошибка,
+    # в том числе ValueError из разбора ответа DeepSeek, — ошибка прогона: 500.
+    except ManualInputError as e:
         message = str(e) or MANUAL_TITLE_LANGUAGE_ERROR
         return jsonify({"ok": False, "error": message}), 400
     except Exception as e:

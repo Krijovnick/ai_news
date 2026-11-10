@@ -42,7 +42,6 @@ h1, h2, h3 { line-height: 1.25; }
   margin-bottom: 0.5rem;
 }
 .status-ok { color: #15803d; }
-.status-failed { color: #b91c1c; }
 .status-running { color: #a16207; }
 .summary, .article-body {
   white-space: pre-wrap;

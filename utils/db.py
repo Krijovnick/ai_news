@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -10,6 +11,8 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 from utils.config import Config, SEED_KEYWORDS
+
+logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
@@ -107,6 +110,12 @@ class NewsDatabase:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self.ensure_schema()
+        # Уборка старых failed — по возможности: занятая база (database is locked)
+        # или другая ошибка не мешает открыть базу, доудалим при следующем открытии.
+        try:
+            self.delete_failed_runs()
+        except Exception as exc:
+            logger.warning("Не удалось удалить упавшие прогоны при открытии базы: %s", exc)
         self.seed_keywords_if_empty()
 
     def close(self) -> None:
@@ -294,7 +303,7 @@ class NewsDatabase:
         return int(cur.lastrowid)
 
     def delete_runs_without_items(self) -> List[int]:
-        """Удаляет прогоны без единой строки в items. Связанные summaries/articles тоже."""
+        """Удаляет прогоны без единой строки в items тем же каскадом, что delete_run."""
         rows = self._conn.execute(
             """
             SELECT r.id FROM runs r
@@ -303,15 +312,41 @@ class NewsDatabase:
         ).fetchall()
         ids = [int(r["id"]) for r in rows]
         for run_id in ids:
+            self.delete_run(run_id)
+        return ids
+
+    def delete_run(self, run_id: int) -> bool:
+        """Удаляет прогон и всё, что к нему привязано.
+
+        items, summaries, articles удаляются; proposed-ключи этого прогона удаляются;
+        у active/rejected обнуляется run_id. False — прогона не было.
+        """
+        try:
+            self._conn.execute("DELETE FROM items WHERE run_id = ?", (run_id,))
             self._conn.execute("DELETE FROM articles WHERE run_id = ?", (run_id,))
             self._conn.execute("DELETE FROM summaries WHERE run_id = ?", (run_id,))
-            # keywords.run_id только ссылка; фразы не трогаем, обнуляем привязку
+            self._conn.execute(
+                "DELETE FROM keywords WHERE run_id = ? AND status = 'proposed'", (run_id,)
+            )
             self._conn.execute(
                 "UPDATE keywords SET run_id = NULL WHERE run_id = ?", (run_id,)
             )
-            self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
-        if ids:
+            cur = self._conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+            deleted = cur.rowcount > 0
             self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return deleted
+
+    def delete_failed_runs(self) -> List[int]:
+        """Удаляет старые прогоны со status=failed каскадом. running не трогает."""
+        rows = self._conn.execute(
+            "SELECT id FROM runs WHERE status = 'failed'"
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        for run_id in ids:
+            self.delete_run(run_id)
         return ids
 
     def finish_run(
@@ -411,7 +446,10 @@ class NewsDatabase:
         self._conn.commit()
 
     def get_run(self, run_id: int) -> Optional[Dict[str, Any]]:
-        row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        """Прогон по id. failed не отдаётся — как будто прогона нет."""
+        row = self._conn.execute(
+            "SELECT * FROM runs WHERE id = ? AND status != 'failed'", (run_id,)
+        ).fetchone()
         return dict(row) if row else None
 
     def get_summary(self, run_id: int) -> Optional[str]:
@@ -516,7 +554,8 @@ class NewsDatabase:
 
     def list_runs(self) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
-            "SELECT * FROM runs ORDER BY started_at DESC, id DESC"
+            "SELECT * FROM runs WHERE status != 'failed' "
+            "ORDER BY started_at DESC, id DESC"
         ).fetchall()
         return [dict(r) for r in rows]
 
