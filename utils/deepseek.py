@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -30,6 +29,10 @@ CHAT_TIMEOUT = 300
 CHAT_RETRY_DELAYS: Tuple[float, ...] = (5, 15)
 # Потолок паузы из Retry-After для 429 (секунды или HTTP-date), секунды.
 CHAT_RETRY_AFTER_MAX = 60
+# Неразобранный ответ плана или статьи (не JSON, нет полей): всего попыток (1 повтор).
+UNPARSED_ATTEMPTS = 2
+# Сколько символов сырого ответа с начала и с конца писать в лог при неразборе.
+RAW_LOG_EDGE_CHARS = 300
 
 # Search/Fetch API DeepSeek: полные тексты и дополнительные источники для статьи.
 FETCH_URL = "https://api.deepseek.com/v1/tools/fetch"
@@ -178,6 +181,7 @@ class DeepSeekClient:
         self.model = model or Config.DEEPSEEK_MODEL
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY не установлен")
+        self.last_finish_reason: Optional[str] = None
 
     def _chat(
         self,
@@ -185,7 +189,14 @@ class DeepSeekClient:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         step: str = "запрос DeepSeek",
+        json_mode: bool = False,
     ) -> str:
+        """Текст ответа модели. finish_reason последнего ответа — в self.last_finish_reason.
+
+        json_mode=True включает JSON-режим DeepSeek (response_format json_object): для плана
+        и статьи. Для разбора недели не включается — там нужен обычный текст.
+        """
+        self.last_finish_reason = None
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -193,15 +204,37 @@ class DeepSeekClient:
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         response = self._post_chat_with_retry(payload, step)
         data = response.json()
         choice = data["choices"][0]
+        self.last_finish_reason = choice.get("finish_reason")
         if choice.get("finish_reason") == "length":
             logger.warning(
                 "Ответ DeepSeek обрезан по max_tokens (%s)", max_tokens or "по умолчанию"
             )
         # content может прийти null — отдаём пустую строку, разбор решит дальше.
         return (choice["message"].get("content") or "").strip()
+
+    def _log_unparsed(self, step: str, raw: str, attempt: int) -> None:
+        """WARNING про неразобранный ответ модели: finish_reason, длина, начало и конец текста."""
+        tail = (
+            f"повторяю запрос (попытка {attempt + 1} из {UNPARSED_ATTEMPTS})"
+            if attempt < UNPARSED_ATTEMPTS
+            else "попытки исчерпаны"
+        )
+        logger.warning(
+            "DeepSeek, %s: ответ не разобран (не JSON-объект или нет обязательных полей; попытка %s из %s, finish_reason=%s, "
+            "длина %s симв.), %s. Ответ: %s",
+            step,
+            attempt,
+            UNPARSED_ATTEMPTS,
+            getattr(self, "last_finish_reason", None),
+            len(raw or ""),
+            tail,
+            _raw_excerpt(raw),
+        )
 
     def _post_chat_with_retry(self, payload: Dict[str, Any], step: str) -> requests.Response:
         """POST chat/completions с повтором временных сбоев; прочие ошибки — сразу наверх.
@@ -326,15 +359,22 @@ class DeepSeekClient:
             materials=format_titles_for_plan(items),
         )
         # Ошибка запроса плана (после повторов в _chat) пробрасывается: без плана статей нет.
-        raw_plan = self._chat(
-            [
-                {"role": "system", "content": prompts["plan_system"]},
-                {"role": "user", "content": plan_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=PLAN_MAX_TOKENS,
-            step="план статей",
-        )
+        # Неразобранный ответ плана — один повтор запроса (без плана пропадают все статьи).
+        plan_messages = [
+            {"role": "system", "content": prompts["plan_system"]},
+            {"role": "user", "content": plan_prompt},
+        ]
+        for attempt in range(1, UNPARSED_ATTEMPTS + 1):
+            raw_plan = self._chat(
+                plan_messages,
+                temperature=0.3,
+                max_tokens=PLAN_MAX_TOKENS,
+                step="план статей",
+                json_mode=True,
+            )
+            if _load_plan_object(raw_plan) is not None:
+                break
+            self._log_unparsed("план статей", raw_plan, attempt)
         topics, keywords = _parse_plan_payload(raw_plan, item_count=len(items))
         if limit > 0:
             topics = topics[:limit]
@@ -355,29 +395,43 @@ class DeepSeekClient:
                 materials=format_article_materials(materials),
                 extra_sources=format_extra_sources(extras),
             )
-            try:
-                raw_article = self._chat(
-                    [
-                        {"role": "system", "content": prompts["write_system"]},
-                        {"role": "user", "content": write_prompt},
-                    ],
-                    temperature=0.8,
-                    max_tokens=ARTICLE_MAX_TOKENS,
-                    step=f"статья «{topic['topic']}»",
-                )
-            # Сеть/HTTP-ошибка (после повторов в _chat) или битая структура ответа —
-            # пропускаем только эту статью.
-            except (
-                requests.RequestException,
-                KeyError,
-                IndexError,
-                TypeError,
-                AttributeError,
-                ValueError,
-            ) as exc:
-                logger.error("Статья «%s» не написана: %s", topic["topic"], exc)
+            write_messages = [
+                {"role": "system", "content": prompts["write_system"]},
+                {"role": "user", "content": write_prompt},
+            ]
+            step = f"статья «{topic['topic']}»"
+            article: Optional[Dict[str, Any]] = None
+            failed = False
+            # Неразобранный ответ статьи — один повтор запроса; ошибка запроса — без повтора
+            # здесь (временные сбои уже повторены в _chat).
+            for attempt in range(1, UNPARSED_ATTEMPTS + 1):
+                try:
+                    raw_article = self._chat(
+                        write_messages,
+                        temperature=0.8,
+                        max_tokens=ARTICLE_MAX_TOKENS,
+                        step=step,
+                        json_mode=True,
+                    )
+                # Сеть/HTTP-ошибка (после повторов в _chat) или битая структура ответа —
+                # пропускаем только эту статью.
+                except (
+                    requests.RequestException,
+                    KeyError,
+                    IndexError,
+                    TypeError,
+                    AttributeError,
+                    ValueError,
+                ) as exc:
+                    logger.error("Статья «%s» не написана: %s", topic["topic"], exc)
+                    failed = True
+                    break
+                article = _parse_article_payload(raw_article)
+                if article is not None:
+                    break
+                self._log_unparsed(step, raw_article, attempt)
+            if failed:
                 continue
-            article = _parse_article_payload(raw_article)
             if article is None:
                 logger.error("Статья «%s»: ответ DeepSeek не разобран", topic["topic"])
                 continue
@@ -613,24 +667,79 @@ def _item_urls(items: Sequence[Dict[str, Any]]) -> List[str]:
     return urls
 
 
-def _load_json_object(raw: str) -> Optional[Dict[str, Any]]:
-    text = raw.strip()
-    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if fence:
-        text = fence.group(1).strip()
+def _raw_excerpt(raw: Optional[str]) -> str:
+    """Сырой ответ для лога: целиком, если короткий, иначе начало … конец."""
+    text = raw or ""
+    if not text:
+        return "(пусто)"
+    edge = RAW_LOG_EDGE_CHARS
+    if len(text) <= edge * 2:
+        return repr(text)
+    return f"{text[:edge]!r} … {text[-edge:]!r}"
+
+
+def _try_json_object(text: str) -> Optional[Dict[str, Any]]:
+    # strict=False: сырые переводы строк и табы внутри строк JSON не ломают разбор.
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # Попытка вырезать объект
-        start = text.find("{")
-        end = text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
+        data = json.loads(text, strict=False)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
     return data if isinstance(data, dict) else None
+
+
+def _strip_outer_fence(text: str) -> Optional[str]:
+    """Снимает внешнее ```-ограждение, если им обёрнут весь ответ; иначе None."""
+    if not (text.startswith("```") and text.endswith("```") and len(text) >= 6):
+        return None
+    inner = text[3:-3]
+    # Первая строка ограждения — метка языка (```json); содержимое — со следующей строки.
+    newline = inner.find("\n")
+    if newline >= 0 and not inner[:newline].strip().startswith("{"):
+        inner = inner[newline + 1 :]
+    elif inner.lower().startswith("json"):
+        inner = inner[4:]
+    return inner.strip()
+
+
+def _load_json_object(raw: str) -> Optional[Dict[str, Any]]:
+    """JSON-объект из ответа модели.
+
+    Порядок: весь текст как есть; весь ответ во внешнем ```-ограждении — без него;
+    вырезка от первой { до последней }. Других кандидатов нет: блок кода внутри
+    невалидного объекта (JSON-пример в body) за ответ не принимается.
+    Блоки кода ``` внутри строк JSON (например, в body статьи) разбору не мешают.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    candidates: List[str] = [text]
+    inner = _strip_outer_fence(text)
+    if inner is not None:
+        candidates.append(inner)
+    for base in (inner, text):
+        if base is None:
+            continue
+        start = base.find("{")
+        end = base.rfind("}")
+        if 0 <= start < end:
+            candidates.append(base[start : end + 1])
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        data = _try_json_object(candidate)
+        if data is not None:
+            return data
+    return None
+
+
+def _load_plan_object(raw: str) -> Optional[Dict[str, Any]]:
+    """Объект плана: JSON-объект с ключом topics-списком (пустой список допустим)."""
+    data = _load_json_object(raw)
+    if data is None or not isinstance(data.get("topics"), list):
+        return None
+    return data
 
 
 def _parse_plan_payload(
@@ -641,14 +750,14 @@ def _parse_plan_payload(
 
     Материал попадает не более чем в одну тему; тема без валидных материалов отбрасывается.
     """
-    data = _load_json_object(raw)
+    data = _load_plan_object(raw)
     if data is None:
         logger.error("Не удалось разобрать план статей DeepSeek как JSON")
         return [], []
 
     used: set = set()
     topics: List[Dict[str, Any]] = []
-    for t in data.get("topics") or []:
+    for t in data["topics"]:
         if not isinstance(t, dict):
             continue
         topic = str(t.get("topic") or "").strip()

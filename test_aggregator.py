@@ -684,7 +684,48 @@ class DeepSeekPromptsTests(unittest.TestCase):
                     client._chat([{"role": "user", "content": "x"}])
             sleep.assert_called_once_with(expected)
 
-    def test_unparsed_model_answer_not_retried(self):
+    def test_unparsed_article_retried_once_then_succeeds(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+        first_topic_calls = []
+        garbage = "НАЧАЛО" + "x" * 1000 + "КОНЕЦ"
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls.append(json)
+            user = json["messages"][1]["content"]
+            if "Материал 1" in user and "Материал 2" in user:
+                return self._chat_response(self._TWO_TOPICS_PLAN)
+            if "Материал 1" in user:
+                first_topic_calls.append(1)
+                if len(first_topic_calls) == 1:
+                    return self._chat_response(garbage)
+                return self._chat_response('{"title":"Статья 1","body":"Текст","rationale":""}')
+            return self._chat_response('{"title":"Статья 2","body":"Текст","rationale":""}')
+
+        with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
+            "utils.deepseek.time.sleep"
+        ) as sleep:
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(len(calls), 4)  # план + 2 попытки первой + вторая
+        sleep.assert_not_called()
+        self.assertEqual([a["title"] for a in articles], ["Статья 1", "Статья 2"])
+        warnings = [m for m in cm.output if "WARNING" in m and "не разобран" in m]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Первая", warnings[0])
+        self.assertIn("finish_reason=stop", warnings[0])
+        self.assertIn(str(len(garbage)), warnings[0])
+        self.assertIn("НАЧАЛО", warnings[0])
+        self.assertIn("КОНЕЦ", warnings[0])
+        self.assertLess(len(warnings[0]), len(garbage))
+        self.assertFalse(any("ERROR" in m for m in cm.output))
+
+    def test_unparsed_article_twice_skipped_with_error(self):
         from utils.deepseek import DeepSeekClient, clear_prompts_cache
 
         clear_prompts_cache()
@@ -695,21 +736,216 @@ class DeepSeekPromptsTests(unittest.TestCase):
             calls.append(1)
             if len(calls) == 1:
                 return self._chat_response(self._TWO_TOPICS_PLAN)
-            if len(calls) == 2:
+            if len(calls) in (2, 3):
                 return self._chat_response("не JSON")
             return self._chat_response('{"title":"Статья 2","body":"Текст","rationale":""}')
 
         with patch("utils.deepseek.requests.post", side_effect=fake_post), patch(
             "utils.deepseek.time.sleep"
         ) as sleep:
-            with self.assertLogs("utils.deepseek", level="ERROR") as cm:
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
                 articles, _ = client.build_articles_and_keywords(
                     self._TWO_ITEMS, "разбор", web_tools=False
                 )
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)  # план + 2 попытки первой + вторая
         sleep.assert_not_called()
         self.assertEqual([a["title"] for a in articles], ["Статья 2"])
-        self.assertTrue(any("не разобран" in m for m in cm.output))
+        self.assertEqual(
+            len([m for m in cm.output if "WARNING" in m and "не разобран" in m]), 2
+        )
+        self.assertTrue(
+            any("ERROR" in m and "Первая" in m and "не разобран" in m for m in cm.output)
+        )
+
+    def test_unparsed_plan_retried_once(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        with patch(
+            "utils.deepseek.requests.post",
+            side_effect=[
+                self._chat_response(""),
+                self._chat_response('{"topics":[],"keywords":["k"]}'),
+            ],
+        ) as post:
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, keywords = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual((articles, keywords), ([], ["k"]))
+        self.assertTrue(
+            any("WARNING" in m and "план статей" in m and "(пусто)" in m for m in cm.output)
+        )
+        self.assertFalse(any("ERROR" in m for m in cm.output))
+
+    def test_unparsed_plan_twice_gives_no_articles(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        with patch(
+            "utils.deepseek.requests.post", return_value=self._chat_response("не JSON")
+        ) as post:
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, keywords = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual((articles, keywords), ([], []))
+        self.assertTrue(any("ERROR" in m and "план" in m for m in cm.output))
+
+    def test_response_format_json_for_plan_and_article_not_weekly(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        payloads = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            payloads.append(json)
+            user = json["messages"][1]["content"]
+            if "item_ids" in user:
+                return self._chat_response(self._TWO_TOPICS_PLAN)
+            if "Тема:" in user:
+                return self._chat_response('{"title":"С","body":"Т","rationale":""}')
+            return self._chat_response("разбор")
+
+        with patch("utils.deepseek.requests.post", side_effect=fake_post):
+            client.build_weekly_analysis(self._TWO_ITEMS)
+            client.build_articles_and_keywords(self._TWO_ITEMS, "разбор", web_tools=False)
+        self.assertEqual(len(payloads), 4)
+        self.assertNotIn("response_format", payloads[0])  # разбор недели
+        for p in payloads[1:]:  # план и две статьи
+            self.assertEqual(p.get("response_format"), {"type": "json_object"})
+            # DeepSeek требует в промпте JSON-режима слово json и пример.
+            text = " ".join(m["content"] for m in p["messages"]).lower()
+            self.assertIn("json", text)
+            self.assertIn('{"', text)
+
+    def test_load_json_object_body_with_code_fence_inside_outer_fence(self):
+        import json as _json
+
+        from utils.deepseek import _load_json_object, _parse_article_payload
+
+        body = 'Пример конфига:\n```json\n{"mcpServers": {"fs": {}}}\n```\nИ ещё ```code```.'
+        payload = _json.dumps(
+            {"title": "MCP", "body": body, "rationale": "r"}, ensure_ascii=False
+        )
+        for raw in (
+            payload,
+            "```json\n" + payload + "\n```",
+            "```\n" + payload + "\n```",
+            "Вот ответ:\n```json\n" + payload + "\n```",
+        ):
+            with self.subTest(raw=raw[:20]):
+                article = _parse_article_payload(raw)
+                self.assertIsNotNone(article)
+                self.assertEqual(article["body"], body)
+        self.assertIsNone(_load_json_object(""))
+        self.assertIsNone(_load_json_object("```json\n```"))
+
+    def test_load_json_object_raw_newline_inside_string(self):
+        from utils.deepseek import _parse_article_payload
+
+        raw = '{"title":"Т","body":"Первый абзац.\n\nВторой\tабзац.","rationale":""}'
+        article = _parse_article_payload(raw)
+        self.assertIsNotNone(article)
+        self.assertEqual(article["body"], "Первый абзац.\n\nВторой\tабзац.")
+        self.assertIsNotNone(_parse_article_payload("```json\n" + raw + "\n```"))
+
+    # Невалидный внешний объект (неэкранированные кавычки) с JSON-примером в body.
+    _BROKEN_ARTICLE_WITH_INNER_EXAMPLE = (
+        '{"title":"X","body":"Пример:\n```json\n{"title": "inner", "body": "inner"}\n```"}'
+    )
+    _BROKEN_PLAN_WITH_INNER_EXAMPLE = (
+        '{"title":"MCP","body":"Конфиг:\n```json\n{"mcpServers": {}}\n```\nконец"}'
+    )
+
+    def test_inner_code_example_not_taken_as_answer(self):
+        from utils.deepseek import (
+            _load_json_object,
+            _load_plan_object,
+            _parse_article_payload,
+        )
+
+        self.assertIsNone(_parse_article_payload(self._BROKEN_ARTICLE_WITH_INNER_EXAMPLE))
+        self.assertIsNone(_load_json_object(self._BROKEN_PLAN_WITH_INNER_EXAMPLE))
+        self.assertIsNone(_load_plan_object(self._BROKEN_PLAN_WITH_INNER_EXAMPLE))
+        # Вложенный пример с topics внутри невалидного объекта — тоже не план.
+        self.assertIsNone(
+            _load_plan_object('{"a":"x\n```json\n{"topics": [], "keywords": []}\n```"}')
+        )
+
+    def test_broken_article_with_inner_example_retried_then_error(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        calls = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            calls.append(1)
+            if len(calls) == 1:
+                return self._chat_response(self._TWO_TOPICS_PLAN)
+            if len(calls) in (2, 3):
+                return self._chat_response(self._BROKEN_ARTICLE_WITH_INNER_EXAMPLE)
+            return self._chat_response('{"title":"Статья 2","body":"Текст","rationale":""}')
+
+        with patch("utils.deepseek.requests.post", side_effect=fake_post):
+            with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                articles, _ = client.build_articles_and_keywords(
+                    self._TWO_ITEMS, "разбор", web_tools=False
+                )
+        self.assertEqual(len(calls), 4)
+        self.assertEqual([a["title"] for a in articles], ["Статья 2"])
+        self.assertEqual(
+            len([m for m in cm.output if "WARNING" in m and "не разобран" in m]), 2
+        )
+        self.assertTrue(
+            any("ERROR" in m and "Первая" in m and "не разобран" in m for m in cm.output)
+        )
+
+    def test_plan_with_inner_example_or_without_topics_retried(self):
+        from utils.deepseek import DeepSeekClient, clear_prompts_cache
+
+        clear_prompts_cache()
+        client = DeepSeekClient(api_key="test-key")
+        for bad in (
+            self._BROKEN_PLAN_WITH_INNER_EXAMPLE,
+            '{"keywords":["k"]}',
+            '{"topics":"не список","keywords":["k"]}',
+        ):
+            with self.subTest(bad=bad[:20]):
+                with patch(
+                    "utils.deepseek.requests.post",
+                    side_effect=[
+                        self._chat_response(bad),
+                        self._chat_response('{"topics":[],"keywords":["ok"]}'),
+                    ],
+                ) as post:
+                    with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                        articles, keywords = client.build_articles_and_keywords(
+                            self._TWO_ITEMS, "разбор", web_tools=False
+                        )
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual((articles, keywords), ([], ["ok"]))
+                self.assertTrue(
+                    any("WARNING" in m and "план статей" in m for m in cm.output)
+                )
+                self.assertFalse(any("ERROR" in m for m in cm.output))
+
+                with patch(
+                    "utils.deepseek.requests.post", return_value=self._chat_response(bad)
+                ) as post:
+                    with self.assertLogs("utils.deepseek", level="WARNING") as cm:
+                        articles, keywords = client.build_articles_and_keywords(
+                            self._TWO_ITEMS, "разбор", web_tools=False
+                        )
+                self.assertEqual(post.call_count, 2)
+                self.assertEqual((articles, keywords), ([], []))
+                self.assertTrue(any("ERROR" in m and "план" in m for m in cm.output))
 
     def test_article_skipped_after_retries_exhausted(self):
         from utils.deepseek import CHAT_RETRY_DELAYS, DeepSeekClient, clear_prompts_cache
